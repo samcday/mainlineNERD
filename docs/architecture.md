@@ -133,6 +133,12 @@ store tables; our SQLite archive is the only source of truth for cursors.
   responses are paced even when the token changes, and their checkpoint is
   still committed. A 401 stops the whole run; a 403 or not-found affects only
   that room.
+- Every wait (startup pause, retry sleep, global cooldown, pacing deadline) is
+  converted with one checked-deadline rule: `Instant::checked_add` must yield
+  the full requested instant, otherwise the operation stops with a bounded
+  `DeadlineUnrepresentable` error. A delay is never capped, shortened or
+  skipped, and sleeps target the checked absolute deadline, so an early request
+  can never be issued before a server-mandated pause expires.
 - A configured room that is idle and absent from `/sync` still gets a base
   cursor: a never-started cursor is seeded from the committed global token in
   the same transaction that first makes that token available, for ready,

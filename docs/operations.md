@@ -42,7 +42,9 @@ a wrong event type or state key, or a mis-addressed event leaves the room
 unready with a bounded reason in `status`; nothing is collected for it and a
 corrected response recovers on a later start. Startup failures are isolated per
 room with bounded retries for transient/rate-limited errors; authentication and
-client-build failures stop the whole run.
+client-build failures stop the whole run. A startup pause that cannot be
+represented as a local deadline stops initialization with a clear error rather
+than retrying early.
 
 ## Commands
 
@@ -102,6 +104,12 @@ Any failure in steps 1-5 refuses the run before a single event is ingested.
   honours `Retry-After` (seconds or HTTP date) or the Matrix retry hint, and
   falls back to a conservative delay when neither is present; it always halts
   history before another room is attempted.
+- Every retry/cooldown/scheduler wait is applied in full or not at all. If a
+  requested pause cannot be represented as a local deadline (an extreme delay
+  beyond the platform's `Instant` range), startup or the run stops with a
+  `DeadlineUnrepresentable` error naming the delay. The wait is never
+  shortened, capped or skipped, so a request is never sent before a server's
+  pause has elapsed.
 - A 401 stops the whole run; a 403 or not-found affects only that room, which is
   stalled in `status` until an operator acts.
 - An observed own `leave`/`ban`, an encrypted room, or a room with a known

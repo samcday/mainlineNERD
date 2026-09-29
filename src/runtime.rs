@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use matrix_sdk::ruma::{OwnedRoomId, OwnedServerName};
-use tokio::time::{sleep, sleep_until, Instant};
+use tokio::time::{sleep_until, Instant};
 
 use crate::config::{Config, RoomSelector};
 use crate::engine::{
@@ -131,6 +131,15 @@ pub enum RuntimeError {
     DeviceUnverified(String),
     #[error("configured room list is empty")]
     EmptyRooms,
+    /// A required pause (a server rate-limit hint, the configured fallback or a
+    /// scheduler delay) cannot be represented as an `Instant` on this platform.
+    /// Shortening, capping or skipping the pause could issue a request before
+    /// the server's pause elapsed, so initialization/the run stops instead.
+    #[error(
+        "cannot wait {delay:?}: that deadline is not representable on this platform; \
+         stopping instead of retrying early"
+    )]
+    DeadlineUnrepresentable { delay: Duration },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -249,11 +258,15 @@ pub async fn initialize_with_policy(
                             Err(error) => match startup_backoff(policy, attempt, &error) {
                                 StartupStep::Retry(delay) => {
                                     attempt += 1;
-                                    sleep(delay).await;
+                                    sleep_checked(delay).await?;
                                 }
                                 StartupStep::GiveUp(pause) => {
                                     if let Some(delay) = pause {
-                                        extend_startup_cooldown(&mut cooldown_until, delay);
+                                        extend_startup_cooldown(
+                                            &mut cooldown_until,
+                                            Instant::now(),
+                                            delay,
+                                        )?;
                                     }
                                     if let AdapterError::Authentication(_)
                                     | AdapterError::Build
@@ -305,11 +318,15 @@ pub async fn initialize_with_policy(
                     Err(error) => match startup_backoff(policy, attempt, &error) {
                         StartupStep::Retry(delay) => {
                             attempt += 1;
-                            sleep(delay).await;
+                            sleep_checked(delay).await?;
                         }
                         StartupStep::GiveUp(pause) => {
                             if let Some(delay) = pause {
-                                extend_startup_cooldown(&mut cooldown_until, delay);
+                                extend_startup_cooldown(
+                                    &mut cooldown_until,
+                                    Instant::now(),
+                                    delay,
+                                )?;
                             }
                             if let AdapterError::Authentication(_)
                             | AdapterError::Build
@@ -349,11 +366,15 @@ pub async fn initialize_with_policy(
                     Err(error) => match startup_backoff(policy, attempt, &error) {
                         StartupStep::Retry(delay) => {
                             attempt += 1;
-                            sleep(delay).await;
+                            sleep_checked(delay).await?;
                         }
                         StartupStep::GiveUp(pause) => {
                             if let Some(delay) = pause {
-                                extend_startup_cooldown(&mut cooldown_until, delay);
+                                extend_startup_cooldown(
+                                    &mut cooldown_until,
+                                    Instant::now(),
+                                    delay,
+                                )?;
                             }
                             if let AdapterError::Authentication(_)
                             | AdapterError::Build
@@ -409,18 +430,40 @@ pub async fn initialize_with_policy(
 }
 
 async fn await_cooldown(deadline: &mut Option<Instant>) {
-    if let Some(until) = *deadline {
-        let now = Instant::now();
-        if until > now {
-            sleep(until - now).await;
-        }
-        *deadline = None;
+    if let Some(until) = deadline.take() {
+        // Sleep to the stored absolute deadline. Reconstructing `now + delay`
+        // here would move unchecked arithmetic into the sleep path and could
+        // overflow an instant that was representable when the deadline was
+        // stored.
+        sleep_until(until).await;
     }
 }
 
-fn extend_startup_cooldown(deadline: &mut Option<Instant>, delay: Duration) {
-    let target = Instant::now() + delay;
+/// The single checked-deadline rule: preserve the complete requested delay
+/// exactly when `now + delay` is representable; otherwise fail with an
+/// explicit, bounded error. The pause is never shortened, capped or skipped.
+fn checked_deadline(now: Instant, delay: Duration) -> Result<Instant, RuntimeError> {
+    now.checked_add(delay)
+        .ok_or(RuntimeError::DeadlineUnrepresentable { delay })
+}
+
+/// Sleep for the whole `delay`, or fail when its deadline is unrepresentable.
+/// Sleeping to the checked absolute instant keeps this path under the same rule
+/// as every other deadline instead of moving unchecked arithmetic into
+/// `tokio::time::sleep`.
+async fn sleep_checked(delay: Duration) -> Result<(), RuntimeError> {
+    sleep_until(checked_deadline(Instant::now(), delay)?).await;
+    Ok(())
+}
+
+fn extend_startup_cooldown(
+    deadline: &mut Option<Instant>,
+    now: Instant,
+    delay: Duration,
+) -> Result<(), RuntimeError> {
+    let target = checked_deadline(now, delay)?;
     *deadline = Some(deadline.map_or(target, |current| std::cmp::max(current, target)));
+    Ok(())
 }
 
 fn own_membership_is_join(store: &Store, room_id: &str) -> Result<bool, StoreError> {
@@ -517,17 +560,17 @@ where
                         waiting_for_history_work = false;
                         history_fut = Some(transport.history(request.clone()));
                         history_in_flight = Some((work, room, request));
-                        next_history_at = now + settings.history_interval;
+                        next_history_at = checked_deadline(now, settings.history_interval)?;
                     }
                     None => {
                         waiting_for_history_work = true;
-                        next_history_at = now + settings.idle_poll;
+                        next_history_at = checked_deadline(now, settings.idle_poll)?;
                     }
                 }
             }
         }
 
-        let far = now + Duration::from_secs(3_600);
+        let far = checked_deadline(now, Duration::from_secs(3_600))?;
         let sync_deadline = if sync_fut.is_none() {
             std::cmp::max(next_sync_at, backoff_until)
         } else {
@@ -576,7 +619,7 @@ where
                         // unchanged tokens, so a chattering server cannot spin.
                         let useful = outcome.events_seen > 0 || outcome.gaps_opened > 0;
                         next_sync_at = if !useful || current.since == previous_since {
-                            now + settings.empty_sync_floor
+                            checked_deadline(now, settings.empty_sync_floor)?
                         } else {
                             now
                         };
@@ -590,7 +633,7 @@ where
                     crate::engine::SyncPollOutcome::RateLimited { retry_after_ms } => {
                         summary.rate_limits += 1;
                         let delay = rate_delay(retry_after_ms, settings.rate_limit_fallback);
-                        extend_backoff(&mut backoff_until, now, delay);
+                        extend_backoff(&mut backoff_until, now, delay)?;
                         next_sync_at = backoff_until;
                         next_history_at = std::cmp::max(next_history_at, backoff_until);
                     }
@@ -605,7 +648,7 @@ where
                                 settings.transient_max,
                                 transient_attempt,
                             ),
-                        );
+                        )?;
                         next_sync_at = backoff_until;
                     }
                 }
@@ -616,7 +659,7 @@ where
                 let Some((work, room, request)) = history_in_flight.take() else {
                     continue;
                 };
-                next_history_at = now + settings.history_interval;
+                next_history_at = checked_deadline(now, settings.history_interval)?;
                 match history_result(
                     &mut engine,
                     work,
@@ -637,14 +680,14 @@ where
                                 settings.transient_max,
                                 transient_attempt,
                             ),
-                        );
+                        )?;
                     }
                     HistoryDisposition::RateLimited { retry_after_ms } => {
                         extend_backoff(
                             &mut backoff_until,
                             now,
                             rate_delay(retry_after_ms, settings.rate_limit_fallback),
-                        );
+                        )?;
                     }
                     HistoryDisposition::Rejected => {
                         summary.rejected += 1;
@@ -660,9 +703,16 @@ where
 }
 
 /// A global cooldown is never shortened by a later result, including a success
-/// or a shorter rate-limit hint from the other plane.
-fn extend_backoff(current: &mut Instant, now: Instant, delay: Duration) {
-    *current = std::cmp::max(*current, now + delay);
+/// or a shorter rate-limit hint from the other plane. The requested delay is
+/// applied in full or the whole run stops; it is never capped or skipped.
+fn extend_backoff(
+    current: &mut Instant,
+    now: Instant,
+    delay: Duration,
+) -> Result<(), RuntimeError> {
+    let target = checked_deadline(now, delay)?;
+    *current = std::cmp::max(*current, target);
+    Ok(())
 }
 
 enum Event {
@@ -971,15 +1021,110 @@ fn transient_delay(min: Duration, max: Duration, attempt: u32) -> Duration {
 fn jittered_backoff(min: Duration, max: Duration, attempt: u32) -> Duration {
     let shift = attempt.min(16);
     let base = min.saturating_mul(1u32 << shift).min(max);
-    base + jitter(base, attempt)
+    base.saturating_add(jitter(base, attempt))
 }
 
-/// Bounded deterministic jitter: up to a quarter of the base delay.
+/// Bounded deterministic jitter: up to a quarter of the base delay. The delay
+/// arithmetic saturates, so an extreme (e.g. `Duration::MAX`) configured bound
+/// cannot overflow before the checked-deadline rule reports it.
 fn jitter(base: Duration, attempt: u32) -> Duration {
-    let quarter = (base.as_millis() / 4) as u64;
+    let quarter = base.as_millis() / 4;
     if quarter == 0 {
         return Duration::ZERO;
     }
-    let fraction = u64::from(attempt.wrapping_mul(2_654_435_761) % 1_000);
-    Duration::from_millis(quarter * fraction / 1_000)
+    let fraction = u128::from(u64::from(attempt.wrapping_mul(2_654_435_761) % 1_000));
+    let millis = quarter * fraction / 1_000;
+    Duration::from_millis(millis.min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full requested delay is preserved exactly when it is representable:
+    /// a 7200-second hint keeps its 7200-second deadline.
+    #[test]
+    fn checked_deadline_preserves_a_representable_delay_exactly() {
+        let now = Instant::now();
+        let delay = Duration::from_secs(7_200);
+        let deadline = checked_deadline(now, delay).unwrap();
+        assert_eq!(deadline, now + delay);
+    }
+
+    /// `Duration::MAX` cannot be added to any instant: it must produce the
+    /// explicit error and never panic.
+    #[test]
+    fn checked_deadline_reports_an_unrepresentable_delay() {
+        let error = checked_deadline(Instant::now(), Duration::MAX).unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::DeadlineUnrepresentable { delay } if delay == Duration::MAX)
+        );
+    }
+
+    /// A failed startup extension must not shorten, clear or otherwise mutate
+    /// the existing cooldown.
+    #[test]
+    fn failed_startup_extension_keeps_the_existing_deadline() {
+        let now = Instant::now();
+        let existing = checked_deadline(now, Duration::from_secs(7_200)).unwrap();
+        let mut deadline = Some(existing);
+
+        let error = extend_startup_cooldown(&mut deadline, now, Duration::MAX).unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::DeadlineUnrepresentable { delay } if delay == Duration::MAX)
+        );
+        assert_eq!(deadline, Some(existing));
+    }
+
+    /// A failed live extension must not shorten, clear or otherwise mutate the
+    /// existing backoff deadline.
+    #[test]
+    fn failed_live_extension_keeps_the_existing_deadline() {
+        let now = Instant::now();
+        let existing = checked_deadline(now, Duration::from_secs(30)).unwrap();
+        let mut backoff = existing;
+
+        let error = extend_backoff(&mut backoff, now, Duration::MAX).unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::DeadlineUnrepresentable { delay } if delay == Duration::MAX)
+        );
+        assert_eq!(backoff, existing);
+    }
+
+    /// Overlapping pauses keep the maximum deadline and never move it earlier.
+    #[test]
+    fn extensions_keep_the_maximum_deadline() {
+        let now = Instant::now();
+        let long = checked_deadline(now, Duration::from_secs(60)).unwrap();
+        let mut startup = Some(long);
+        extend_startup_cooldown(&mut startup, now, Duration::from_secs(10)).unwrap();
+        assert_eq!(startup, Some(long));
+        extend_startup_cooldown(&mut startup, now, Duration::from_secs(120)).unwrap();
+        assert_eq!(
+            startup,
+            Some(checked_deadline(now, Duration::from_secs(120)).unwrap())
+        );
+
+        let mut backoff = long;
+        extend_backoff(&mut backoff, now, Duration::from_secs(10)).unwrap();
+        assert_eq!(backoff, long);
+        extend_backoff(&mut backoff, now, Duration::from_secs(5_400)).unwrap();
+        assert_eq!(
+            backoff,
+            checked_deadline(now, Duration::from_secs(5_400)).unwrap()
+        );
+    }
+
+    /// An extreme configured transient bound must not panic before the checked
+    /// deadline reports it.
+    #[test]
+    fn extreme_transient_backoff_saturates_without_panicking() {
+        let delay = transient_delay(Duration::MAX, Duration::MAX, 4);
+        assert_eq!(delay, Duration::MAX);
+        let error = checked_deadline(Instant::now(), delay).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::DeadlineUnrepresentable { .. }
+        ));
+    }
 }

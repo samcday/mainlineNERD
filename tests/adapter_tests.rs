@@ -1529,3 +1529,68 @@ async fn final_join_429_defers_same_room_metadata() {
         "a failed join must defer the room instead of fetching same-room metadata"
     );
 }
+
+/// A startup pause whose deadline cannot be represented must stop
+/// initialization with an explicit error: the pause is neither capped nor
+/// skipped, the failing room is not retried and no later room is attempted.
+/// `max_attempts = 1` exercises the final-pause cooldown extension and
+/// `max_attempts = 3` the retry sleep; both must stop before another request.
+#[tokio::test]
+async fn unrepresentable_startup_pause_stops_without_follow_on_requests() {
+    for max_attempts in [1u32, 3] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&server, dir.path(), vec![room_id(ROOM), room_id(ROOM2)]);
+        server.state.set_create_state(
+            ROOM,
+            MockResponse::matrix_error(429, "M_LIMIT_EXCEEDED", "slow"),
+        );
+        server
+            .state
+            .set_create_state(ROOM2, MockResponse::json(json!({ "room_version": "11" })));
+        let transport = adapter(&server, &cfg).await;
+        let mut store = Store::open(&cfg.database, &identity(&cfg)).unwrap();
+        let policy = StartupPolicy {
+            max_attempts,
+            rate_limit_fallback: std::time::Duration::MAX,
+            ..tiny_policy()
+        };
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runtime::initialize_with_policy(&transport, &cfg, &mut store, &policy),
+        )
+        .await
+        .expect("an unrepresentable startup pause must not be waited out")
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RuntimeError::DeadlineUnrepresentable { delay }
+                    if delay == std::time::Duration::MAX
+            ),
+            "max_attempts={max_attempts}: {error:?}"
+        );
+
+        let requests = server.state.recorded();
+        let create_state: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.contains("/state/m.room.create"))
+            .collect();
+        assert_eq!(
+            create_state.len(),
+            1,
+            "max_attempts={max_attempts}: no follow-on metadata request: {:?}",
+            requests
+                .iter()
+                .map(|request| (request.method.clone(), request.path.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            create_state[0]
+                .path
+                .contains("/rooms/!room:hs.example.org/"),
+            "max_attempts={max_attempts}: only the failing room was attempted"
+        );
+    }
+}

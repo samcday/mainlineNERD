@@ -1033,6 +1033,114 @@ async fn cancellation_during_a_long_rate_limit_pause_is_prompt() {
     );
 }
 
+/// A live history pause whose deadline cannot be represented must stop the run
+/// with a controlled error: the pause is neither capped nor skipped, no
+/// follow-on request is issued and no cursor or ledger row is touched
+/// speculatively.
+#[tokio::test(start_paused = true)]
+async fn unrepresentable_live_history_pause_stops_without_follow_on_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+    seed_room(&mut store, ROOM, "p0", "$a", "s0");
+
+    let transport = ControllableTransport::new();
+    transport.hold_sync(true);
+    transport.push_history_error(
+        "p0",
+        TransportError::RateLimited {
+            retry_after_ms: None,
+        },
+    );
+    transport.push_history("p0", history_page("p0", None, vec![]));
+    let settings = RunSettings {
+        rate_limit_fallback: Duration::MAX,
+        ..RunSettings::run(1_000)
+    };
+
+    let (_tx, handle) = spawn_run(&transport, store, settings);
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("an unrepresentable pause must not be waited out")
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(runtime::RuntimeError::DeadlineUnrepresentable { delay })
+                if delay == Duration::MAX
+        ),
+        "unexpected run result: {result:?}"
+    );
+    assert_eq!(
+        transport.history_call_count(),
+        1,
+        "no follow-on history request may be issued"
+    );
+    // The fair select may handle the history error before polling the initial
+    // sync future. Either zero or one initial sync is valid; a second is not.
+    assert!(
+        transport.sync_call_count() <= 1,
+        "no follow-on sync request may be issued"
+    );
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT token FROM room_history WHERE room_id = '!room:hs.example.org'"
+        ),
+        Some("p0".to_owned()),
+        "the rate-limited result must not advance the cursor"
+    );
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM history_visited"),
+        0,
+        "no speculative work item or ledger mutation"
+    );
+}
+
+/// The same rule applies to a sync-plane rate limit: an unrepresentable pause
+/// stops the run before another sync is attempted.
+#[tokio::test(start_paused = true)]
+async fn unrepresentable_live_sync_pause_stops_without_another_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let store = open_store(&path);
+
+    let transport = ControllableTransport::new();
+    transport.push_sync_error(TransportError::RateLimited {
+        retry_after_ms: None,
+    });
+    let settings = RunSettings {
+        rate_limit_fallback: Duration::MAX,
+        ..RunSettings::run(1_000)
+    };
+
+    let (_tx, handle) = spawn_run(&transport, store, settings);
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("an unrepresentable pause must not be waited out")
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(runtime::RuntimeError::DeadlineUnrepresentable { delay })
+                if delay == Duration::MAX
+        ),
+        "unexpected run result: {result:?}"
+    );
+    assert_eq!(
+        transport.sync_call_count(),
+        1,
+        "the run must stop before another sync request"
+    );
+    assert_eq!(
+        transport.history_call_count(),
+        0,
+        "no history request is issued after the global stop"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn held_pages_cannot_revive_disabled_rooms() {
     let cases: [(&str, Vec<serde_json::Value>, bool, Option<&str>); 3] = [
