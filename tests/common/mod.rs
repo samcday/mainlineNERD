@@ -578,6 +578,9 @@ pub struct MockState {
     pub aliases: Mutex<HashMap<String, String>>,
     pub create_state: Mutex<HashMap<String, VecDeque<MockResponse>>>,
     pub alias_servers: Mutex<HashMap<String, Vec<String>>>,
+    /// Repro F50: when set for an alias, the directory lookup answers with this
+    /// response instead (e.g. a 502 when the alias' server is unreachable).
+    pub alias_failures: Mutex<HashMap<String, MockResponse>>,
     pub join_result: Mutex<Option<String>>,
     pub join_response: Mutex<Option<MockResponse>>,
     pub join_requires_via: AtomicBool,
@@ -588,9 +591,19 @@ pub struct MockState {
     pub hold_sync: AtomicBool,
     pub sync_gate: Notify,
     pub sync_seen: AtomicUsize,
+    /// Extra current-state content served at `/rooms/{room}/state/{type}/`
+    /// (empty state key), keyed by (room, type). Missing entries are 404.
+    pub room_state: Mutex<HashMap<(String, String), Value>>,
 }
 
 impl MockState {
+    pub fn set_room_state(&self, room_id: &str, event_type: &str, content: Value) {
+        self.room_state
+            .lock()
+            .unwrap()
+            .insert((room_id.to_owned(), event_type.to_owned()), content);
+    }
+
     pub fn push_sync(&self, response: MockResponse) {
         self.sync.lock().unwrap().push_back(response);
     }
@@ -712,6 +725,18 @@ fn mock_router(state: Arc<MockState>) -> Router {
             "/_matrix/client/v3/rooms/{room}/state/m.room.create/",
             get(mock_create_state),
         )
+        .route(
+            "/_matrix/client/v3/rooms/{room}/state/{event_type}",
+            get(mock_room_state),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room}/state/{event_type}/",
+            get(mock_room_state),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room}/state",
+            get(mock_full_state),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_request,
@@ -811,6 +836,9 @@ async fn mock_alias(
     State(state): State<Arc<MockState>>,
     AxumPath(alias): AxumPath<String>,
 ) -> Response {
+    if let Some(failure) = state.alias_failures.lock().unwrap().get(&alias).cloned() {
+        return render(failure);
+    }
     let room_id = state.aliases.lock().unwrap().get(&alias).cloned();
     let servers = state
         .alias_servers
@@ -856,6 +884,46 @@ async fn mock_join(
     state.joined.store(true, Ordering::SeqCst);
     let room_id = state.join_result.lock().unwrap().clone().unwrap_or(room);
     render(MockResponse::json(json!({ "room_id": room_id })))
+}
+
+async fn mock_room_state(
+    State(state): State<Arc<MockState>>,
+    AxumPath((room, event_type)): AxumPath<(String, String)>,
+) -> Response {
+    match state
+        .room_state
+        .lock()
+        .unwrap()
+        .get(&(room, event_type))
+        .cloned()
+    {
+        Some(content) => render(MockResponse::json(content)),
+        None => render(MockResponse::matrix_error(404, "M_NOT_FOUND", "no such state")),
+    }
+}
+
+async fn mock_full_state(
+    State(state): State<Arc<MockState>>,
+    AxumPath(room): AxumPath<String>,
+) -> Response {
+    let events: Vec<Value> = state
+        .room_state
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((r, _), _)| r == &room)
+        .map(|((_, ty), content)| {
+            json!({
+                "type": ty,
+                "event_id": format!("$state-{ty}"),
+                "sender": ALICE,
+                "state_key": "",
+                "origin_server_ts": 2,
+                "content": content
+            })
+        })
+        .collect();
+    render(MockResponse::json(Value::Array(events)))
 }
 
 async fn mock_create_state(

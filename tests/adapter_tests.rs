@@ -446,6 +446,76 @@ async fn create_state_bootstrap_handles_event_and_content_only() {
     );
 }
 
+/// G1 repro: Synapse < 1.135 answers `?format=event` for v3+ rooms with the
+/// client-formatted event dict *without* `event_id` (synapse#15454, fixed by
+/// #18675). The room version is right there in `content.room_version`; the
+/// correct behaviour is to bootstrap the room (at worst as version-only), not
+/// to leave it permanently unready.
+#[tokio::test]
+async fn g1_pre_1_135_synapse_create_event_without_event_id_bootstraps() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&server, dir.path(), vec![room_id(ROOM)]);
+    // Shape of synapse v1.134 `format_event_for_client_v2(event.get_dict())`
+    // for a v10 room: auth/prev/hashes/signatures/depth stripped, no event_id.
+    let synapse_1_134 = json!({
+        "type": "m.room.create",
+        "room_id": ROOM,
+        "sender": "@alice:hs.example.org",
+        "state_key": "",
+        "origin_server_ts": 1,
+        "content": { "creator": "@alice:hs.example.org", "room_version": "10" },
+        "unsigned": { "age": 1234 }
+    });
+    let transport = adapter(&server, &cfg).await;
+    let mut store = Store::open(&cfg.database, &identity(&cfg)).unwrap();
+
+    let mut outcomes = Vec::new();
+    for attempt in 1..=2 {
+        // The mock pops one scripted reply per request; a real old Synapse
+        // answers the same way every time, so re-arm before each run.
+        server
+            .state
+            .set_create_state(ROOM, MockResponse::json(synapse_1_134.clone()));
+        // attempt 2 simulates a restart (fresh transport, same store/server).
+        let transport = adapter(&server, &cfg).await;
+        let report = runtime::initialize_with_policy(&transport, &cfg, &mut store, &tiny_policy())
+            .await
+            .unwrap();
+        eprintln!(
+            "G1 attempt {attempt}: rooms={:?} unready={:?} version={:?} metadata_error={:?}",
+            report.rooms,
+            report.unready,
+            store.room_version_of(ROOM).unwrap(),
+            store.room_metadata_error(ROOM).unwrap()
+        );
+        let version = store.room_version_of(ROOM).unwrap();
+        let error = store.room_metadata_error(ROOM).unwrap();
+        outcomes.push((attempt, report, version, error));
+    }
+    drop(transport);
+    for request in server.state.recorded() {
+        if request.path.contains("m.room.create") {
+            eprintln!("G1 create-state request: {} ?{}", request.path, request.query);
+        }
+    }
+    for (attempt, report, version, error) in outcomes {
+        assert!(
+            error.is_none(),
+            "attempt {attempt}: pre-1.135 Synapse create event must not be a metadata error, got {error:?}"
+        );
+        assert_eq!(
+            version.as_deref(),
+            Some("10"),
+            "attempt {attempt}: room version must be taken from content.room_version"
+        );
+        assert!(
+            report.rooms.iter().any(|room| room == ROOM),
+            "attempt {attempt}: the room must be admitted"
+        );
+    }
+}
+
 #[tokio::test]
 async fn encryption_upgrade_and_own_leave_flag_and_stop_work() {
     let server = MockServer::start().await;
@@ -1593,4 +1663,85 @@ async fn unrepresentable_startup_pause_stops_without_follow_on_requests() {
             "max_attempts={max_attempts}: only the failing room was attempted"
         );
     }
+}
+
+/// F16 repro: a limited rooms.leave timeline (kick/ban after more than the
+/// 20-event window) must not look complete. docs/architecture.md: after the
+/// first sync a limited sync creates a bounded repair job, and a limited sync
+/// with no prev_batch is recorded `unresolved` and never claims coverage.
+#[tokio::test]
+async fn repro_f16_limited_leave_timeline_records_a_gap() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&server, dir.path(), vec![room_id(ROOM)]);
+    let transport = adapter(&server, &cfg).await;
+    transport.allow_room(ROOM.parse().unwrap());
+    let mut store = Store::open(&cfg.database, &identity(&cfg)).unwrap();
+
+    // Sync 1 (initial): joined, room seeded, global token s1 committed.
+    let mut join = serde_json::Map::new();
+    join.insert(
+        ROOM.to_owned(),
+        json!({
+            "timeline": { "events": [create_event("$create", "11"), message("$m0", "before")],
+                          "prev_batch": "p0", "limited": false },
+            "state": { "events": [] }
+        }),
+    );
+    server
+        .state
+        .push_sync(MockResponse::json(sync_body("s1", Value::Object(join))));
+    let batch1 = transport
+        .sync(SyncRequest { since: None, timeout_ms: 1_000 })
+        .await
+        .unwrap();
+    store.apply_sync_batch(&batch1, 10).unwrap();
+
+    // Sync 2 (since s1): >20 events happened, then the bot was kicked. The
+    // room arrives under rooms.leave with a truncated (limited) timeline and
+    // a prev_batch bounding the missing interval.
+    let mut leave = serde_json::Map::new();
+    leave.insert(
+        ROOM.to_owned(),
+        json!({
+            "timeline": {
+                "events": [
+                    message("$m21", "last window message"),
+                    member("$kick", "@ingest:hs.example.org", "leave")
+                ],
+                "prev_batch": "p_leave",
+                "limited": true
+            },
+            "state": { "events": [] }
+        }),
+    );
+    server.state.push_sync(MockResponse::json(
+        json!({ "next_batch": "s2", "rooms": { "leave": Value::Object(leave) } }),
+    ));
+    let batch2 = transport
+        .sync(SyncRequest { since: Some("s1".to_owned()), timeout_ms: 1_000 })
+        .await
+        .unwrap();
+    let left = batch2.rooms.iter().find(|r| r.room_id == ROOM).unwrap();
+    let adapter_limited = left.limited;
+    let adapter_prev_batch = left.prev_batch.clone();
+    eprintln!(
+        "F16 adapter SyncRoomUpdate for left room: limited={adapter_limited} prev_batch={adapter_prev_batch:?} own_membership={:?}",
+        left.own_membership
+    );
+    let outcome = store.apply_sync_batch(&batch2, 20).unwrap();
+    eprintln!("F16 apply outcome gaps_opened={}", outcome.gaps_opened);
+
+    let conn = db(&cfg.database);
+    let gap_rows = scalar_i64(
+        &conn,
+        "SELECT COUNT(*) FROM gap_jobs WHERE room_id = '!room:hs.example.org'",
+    );
+    eprintln!("F16 gap_jobs rows for room after limited leave sync: {gap_rows}");
+
+    assert!(
+        gap_rows >= 1,
+        "limited leave sync (server limited=true, prev_batch=p_leave) left no gap_jobs row \
+         (open or unresolved); adapter reported limited={adapter_limited} prev_batch={adapter_prev_batch:?}"
+    );
 }

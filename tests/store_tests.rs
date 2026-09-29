@@ -4290,3 +4290,132 @@ fn retry_stalled_only_re_enables_eligible_configured_rooms() {
         "a cursor-less unresolved gap is never reopened"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F3 reproducer: structurally invalid m.replace edits and redaction suppression
+// ---------------------------------------------------------------------------
+
+fn invalid_edit_no_new_msgtype(event_id: &str, ts: i64, target: &str, secret: &str) -> serde_json::Value {
+    json!({
+        "type": "m.room.message",
+        "event_id": event_id,
+        "sender": ALICE,
+        "origin_server_ts": ts,
+        "content": {
+            "msgtype": "m.text",
+            "body": format!("* {secret}"),
+            // m.new_content lacks msgtype: structurally invalid per event.rs
+            "m.new_content": { "body": secret },
+            "m.relates_to": { "rel_type": "m.replace", "event_id": target }
+        }
+    })
+}
+
+fn assert_secret_gone(store: &mainlinenerd_ingest::store::Store, path: &std::path::Path, edit_id: &str, secret: &str) {
+    let conn = db(path);
+    let body = scalar_string(
+        &conn,
+        &format!("SELECT body_text FROM events WHERE event_id = '{edit_id}'"),
+    );
+    let raw = scalar_string(
+        &conn,
+        &format!("SELECT raw_json FROM events WHERE event_id = '{edit_id}'"),
+    )
+    .expect("edit raw stored");
+    let mut events = Vec::new();
+    store.export_events(None, &mut events).unwrap();
+    let events = String::from_utf8(events).unwrap();
+    eprintln!("F3 {edit_id}: body_text={body:?}");
+    eprintln!("F3 {edit_id}: raw_json={raw}");
+    eprintln!("F3 {edit_id}: export_contains_secret={}", events.contains(secret));
+    assert!(
+        body.as_deref().map_or(true, |b| !b.contains(secret)),
+        "F3: invalid edit body_text survived redaction of the original: {body:?}"
+    );
+    assert!(!raw.contains(secret), "F3: invalid edit raw_json leaked: {raw}");
+    assert!(!events.contains(secret), "F3: secret leaked into export --kind events");
+}
+
+#[test]
+fn f3_invalid_edit_stored_first_is_suppressed_by_redaction_of_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        create_room("11"),
+        message("$orig", 100, "original body"),
+        invalid_edit_no_new_msgtype("$bad", 150, "$orig", "token-abc123"),
+        redaction("$red", 200, "$orig", true),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    {
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT redacted FROM events WHERE event_id = '$orig'"),
+            1,
+            "precondition: original is redacted"
+        );
+    }
+    assert_secret_gone(&store, &path, "$bad", "token-abc123");
+}
+
+#[test]
+fn f3_invalid_edit_arriving_after_original_redaction_is_suppressed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut first = room_update(ROOM);
+    first.timeline = vec![
+        create_room("11"),
+        message("$orig", 100, "original body"),
+        redaction("$red", 120, "$orig", true),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![first]), 10)
+        .unwrap();
+
+    let mut backfill = room_update(ROOM);
+    backfill.timeline = vec![invalid_edit_no_new_msgtype("$bad", 150, "$orig", "late-token-xyz")];
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![backfill]), 20)
+        .unwrap();
+
+    assert_secret_gone(&store, &path, "$bad", "late-token-xyz");
+}
+
+#[test]
+fn f3_control_valid_edit_is_suppressed() {
+    // Control: same shape but with m.new_content.msgtype -> must be suppressed today.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        create_room("11"),
+        message("$orig", 100, "original body"),
+        json!({
+            "type": "m.room.message",
+            "event_id": "$good",
+            "sender": ALICE,
+            "origin_server_ts": 150,
+            "content": {
+                "msgtype": "m.text",
+                "body": "* token-ctl999",
+                "m.new_content": { "msgtype": "m.text", "body": "token-ctl999" },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig" }
+            }
+        }),
+        redaction("$red", 200, "$orig", true),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+    assert_secret_gone(&store, &path, "$good", "token-ctl999");
+}
