@@ -1,7 +1,8 @@
-//! `mln-ingest`: status, export and an honest stub for live ingestion.
+//! `mln-ingest`: live Matrix ingestion plus offline status and export.
 //!
-//! The live Matrix transport adapter is not part of this checkpoint; `status`
-//! and `export` operate on the durable archive only.
+//! `follow` runs live sync only; `run` also steadily backfills accessible
+//! history for the configured room allowlist. `status` and `export` operate
+//! purely on the durable archive and never touch the network.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -10,22 +11,25 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use mainlinenerd_ingest::store::Store;
+use mainlinenerd_ingest::config::Config;
+use mainlinenerd_ingest::engine::{Engine, EngineConfig};
+use mainlinenerd_ingest::matrix::MatrixTransport;
+use mainlinenerd_ingest::runtime::{self, RunSettings};
+use mainlinenerd_ingest::store::{ArchiveIdentity, Store};
 
 #[derive(Parser)]
 #[command(
     name = "mln-ingest",
-    about = "mainlineNERD passive Matrix ingestion (durable store; live adapter pending)"
+    about = "mainlineNERD passive Matrix ingestion (durable store; live sync and history)"
 )]
 struct Cli {
-    /// Path to the SQLite archive
-    #[arg(
-        long,
-        env = "MLN_DB",
-        default_value = "mainlinenerd.sqlite3",
-        global = true
-    )]
-    db: PathBuf,
+    /// Path to the SQLite archive, for status/export
+    #[arg(long, env = "MLN_DB", global = true)]
+    db: Option<PathBuf>,
+
+    /// Path to the TOML config, for follow/run
+    #[arg(long, env = "MLN_CONFIG", global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -50,10 +54,16 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Live sync follower (not implemented in this checkpoint)
+    /// Follow live sync for the configured rooms only
     Follow,
-    /// Live sync plus concurrent history backfill (not implemented in this checkpoint)
-    Run,
+    /// Follow live sync plus paced history backfill for the configured rooms
+    Run {
+        /// Explicit one-shot recovery: resume stalled base and bounded gap work
+        /// for currently configured, still-eligible rooms at saved cursors.
+        /// It never joins, clears membership/policy flags or rewrites cursors.
+        #[arg(long)]
+        retry_stalled: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -64,9 +74,10 @@ enum ExportKind {
     Events,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    match execute(cli) {
+    match execute(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -75,11 +86,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn execute(cli: Cli) -> anyhow::Result<()> {
+async fn execute(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Status { json } => {
-            let store = Store::open_read_only(&cli.db)
-                .with_context(|| format!("opening archive {}", cli.db.display()))?;
+            let db = cli
+                .db
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("mainlinenerd.sqlite3"));
+            let store = Store::open_read_only(&db)
+                .with_context(|| format!("opening archive {}", db.display()))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&store.status()?)?);
             } else {
@@ -87,8 +102,12 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::Export { kind, room, out } => {
-            let store = Store::open_read_only(&cli.db)
-                .with_context(|| format!("opening archive {}", cli.db.display()))?;
+            let db = cli
+                .db
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("mainlinenerd.sqlite3"));
+            let store = Store::open_read_only(&db)
+                .with_context(|| format!("opening archive {}", db.display()))?;
             let mut writer: Box<dyn Write> = match &out {
                 Some(path) => Box::new(BufWriter::new(create_export_file(path)?)),
                 None => Box::new(BufWriter::new(io::stdout().lock())),
@@ -100,14 +119,99 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
             writer.flush()?;
             eprintln!("exported {count} records");
         }
-        Command::Follow | Command::Run => {
-            anyhow::bail!(
-                "the live Matrix transport adapter is not implemented in this checkpoint. \
-                 `status` and `export` work against an existing archive; ingestion will be \
-                 enabled by the matrix-sdk adapter task (see docs/architecture.md)."
-            );
-        }
+        Command::Follow => live(cli.config, false, false).await?,
+        Command::Run { retry_stalled } => live(cli.config, true, retry_stalled).await?,
     }
+    Ok(())
+}
+
+async fn live(
+    config_path: Option<PathBuf>,
+    history: bool,
+    retry_stalled: bool,
+) -> anyhow::Result<()> {
+    let config_path = config_path.context(
+        "follow/run require --config (or MLN_CONFIG); see config.example.toml in the repository",
+    )?;
+    let config = Config::load(&config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
+    config
+        .ensure_storage()
+        .context("checking private storage")?;
+    let token = config.obtain_token()?;
+
+    let adapter = MatrixTransport::connect(&config, &token)
+        .await
+        .context("connecting to the homeserver")?;
+
+    let identity = ArchiveIdentity {
+        homeserver: config.homeserver.clone(),
+        user_id: config.user_id.clone(),
+        device_id: config.device_id.clone(),
+    };
+    let mut store = Store::open(&config.database, &identity)
+        .with_context(|| format!("opening archive {}", config.database.display()))?;
+
+    let report = runtime::initialize(&adapter, &config, &mut store)
+        .await
+        .context("validating identity and the configured rooms")?;
+    eprintln!(
+        "rooms: {} ready, {} joined, {} versions learned, {} unready",
+        report.rooms.len(),
+        report.joined.len(),
+        report.versions_learned.len(),
+        report.unready.len()
+    );
+    for (room, reason) in &report.unready {
+        eprintln!("unready room {room}: {reason}");
+    }
+
+    if retry_stalled {
+        // Explicit one-shot recovery after access was restored outside this
+        // tool. Only currently configured, still-eligible rooms are re-enabled,
+        // at their saved cursors; membership and policy flags are untouched.
+        let retried = store
+            .retry_stalled_configured(mainlinenerd_ingest::store::now_unix_ms())
+            .context("re-enabling stalled history work")?;
+        eprintln!(
+            "retry-stalled: {} work item(s) resumed ({} base, {} bounded gap(s))",
+            retried.total(),
+            retried.base,
+            retried.gaps
+        );
+    }
+
+    let engine_config = EngineConfig {
+        sync_timeout_ms: config.sync_timeout_ms,
+        history_limit: config.history_limit,
+        max_pages_per_room: 64,
+    };
+    let engine = Engine::new(adapter, store, engine_config);
+    let settings = if history {
+        RunSettings::run(config.history_interval_ms)
+    } else {
+        RunSettings::follow()
+    };
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let summary = runtime::run(engine, settings, shutdown)
+        .await
+        .context("live ingestion stopped")?;
+    eprintln!(
+        "stopped: sync_batches={} sync_events={} history_pages={} history_events={} \
+         rooms_completed={} gaps_repaired={} deferred={} unavailable={} rate_limits={}",
+        summary.sync_batches,
+        summary.sync_events,
+        summary.history_pages,
+        summary.history_events,
+        summary.rooms_completed,
+        summary.gaps_repaired,
+        summary.deferred,
+        summary.unavailable,
+        summary.rate_limits
+    );
     Ok(())
 }
 

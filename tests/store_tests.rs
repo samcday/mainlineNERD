@@ -2900,7 +2900,7 @@ fn old_schema_without_cursor_token_is_rejected_and_left_untouched() {
         writable,
         StoreError::SchemaTooOld {
             found: 1,
-            supported: 2
+            supported: 3
         }
     ));
     let read_only = mainlinenerd_ingest::store::Store::open_read_only(&path)
@@ -2910,7 +2910,7 @@ fn old_schema_without_cursor_token_is_rejected_and_left_untouched() {
         read_only,
         StoreError::SchemaTooOld {
             found: 1,
-            supported: 2
+            supported: 3
         }
     ));
 
@@ -2948,7 +2948,7 @@ fn newer_schema_version_is_rejected_in_both_open_paths() {
     let path = dir.path().join("archive.db");
     {
         let conn = db(&path);
-        conn.execute_batch("CREATE TABLE sentinel (x INTEGER); PRAGMA user_version = 3;")
+        conn.execute_batch("CREATE TABLE sentinel (x INTEGER); PRAGMA user_version = 4;")
             .unwrap();
     }
 
@@ -2958,8 +2958,8 @@ fn newer_schema_version_is_rejected_in_both_open_paths() {
     assert!(matches!(
         writable,
         StoreError::SchemaTooNew {
-            found: 3,
-            supported: 2
+            found: 4,
+            supported: 3
         }
     ));
     let read_only = mainlinenerd_ingest::store::Store::open_read_only(&path)
@@ -2968,29 +2968,36 @@ fn newer_schema_version_is_rejected_in_both_open_paths() {
     assert!(matches!(
         read_only,
         StoreError::SchemaTooNew {
-            found: 3,
-            supported: 2
+            found: 4,
+            supported: 3
         }
     ));
 
     let conn = db(&path);
-    assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 3);
+    assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 4);
 }
 
 #[test]
-fn fresh_archive_records_schema_version_two_and_the_ledger() {
+fn fresh_archive_records_schema_version_three_and_the_ledger() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archive.db");
     let store = open_store(&path);
-    assert_eq!(store.status().unwrap().schema_version, 2);
+    assert_eq!(store.status().unwrap().schema_version, 3);
     drop(store);
 
     let conn = db(&path);
-    assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 2);
+    assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 3);
     assert_eq!(
         scalar_i64(
             &conn,
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history_visited'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'room_pins'"
         ),
         1
     );
@@ -3750,4 +3757,351 @@ fn a_never_started_base_row_adopts_a_later_prev_batch_and_never_rewinds() {
         .unwrap();
     assert!(store.room_history_complete(ROOM).unwrap());
     assert_eq!(store.room_history_token(ROOM).unwrap(), None);
+}
+
+#[test]
+fn history_commit_rechecks_mutable_room_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+
+    let controls: Vec<(&str, Vec<serde_json::Value>, Option<&str>)> = vec![
+        ("encrypted", vec![encryption_event()], None),
+        ("upgraded", vec![tombstone("!next:hs.example.org")], None),
+        ("left", vec![], Some("leave")),
+    ];
+    for (label, state, membership) in controls {
+        let _ = std::fs::remove_file(&path);
+        let mut store = open_store(&path);
+        let mut room = room_update(ROOM);
+        room.state = vec![create_room("11")];
+        room.state.extend(state);
+        room.timeline = vec![message("$live", 100, "live")];
+        room.prev_batch = Some("p1".to_owned());
+        room.own_membership = membership.map(str::to_owned);
+        store
+            .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+            .unwrap();
+
+        let outcome = store
+            .apply_history_page(
+                ROOM,
+                HistoryWork::Base,
+                "p1",
+                &history_page("p1", None, vec![message("$old", 50, "old")]),
+                20,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, Some(HistoryStatus::Stale), "{label}");
+        assert_eq!(outcome.events_seen, 0, "{label}");
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM events WHERE event_id = '$old'"),
+            0,
+            "{label}: no speculative event"
+        );
+        assert_eq!(
+            store.room_history_token(ROOM).unwrap().as_deref(),
+            Some("p1"),
+            "{label}: cursor unchanged"
+        );
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM history_visited"),
+            0,
+            "{label}: ledger unchanged"
+        );
+    }
+}
+
+#[test]
+fn seed_configured_room_history_only_fills_never_started_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+    store.register_configured_room(ROOM, None, 10).unwrap();
+    // A first sync with no prev_batch leaves the room honestly unseeded; the
+    // committed global token becomes a valid starting point.
+    let mut room = room_update(ROOM);
+    room.timeline = vec![message("$live", 100, "live")];
+    store
+        .apply_sync_batch(&sync_batch("s5", vec![room]), 10)
+        .unwrap();
+    assert_eq!(store.room_history_token(ROOM).unwrap(), None);
+
+    assert!(store.seed_configured_room_history(ROOM, 20).unwrap());
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("s5")
+    );
+    // A second seed is a no-op and never rewinds.
+    assert!(!store.seed_configured_room_history(ROOM, 30).unwrap());
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("s5")
+    );
+
+    // A non-configured room is never seeded.
+    let mut other = room_update(ROOM2);
+    other.timeline = vec![message("$other", 100, "other")];
+    store
+        .apply_sync_batch(&sync_batch("s6", vec![other]), 10)
+        .unwrap();
+    assert!(!store.seed_configured_room_history(ROOM2, 30).unwrap());
+    assert_eq!(store.room_history_token(ROOM2).unwrap(), None);
+}
+
+#[test]
+fn set_configured_rooms_clears_removed_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let store = open_store(&path);
+    store.register_configured_room(ROOM, None, 10).unwrap();
+    store.register_configured_room(ROOM2, None, 10).unwrap();
+    store.set_configured_rooms(&[ROOM.to_owned()], 20).unwrap();
+    assert!(store.room_configured(ROOM).unwrap());
+    assert!(!store.room_configured(ROOM2).unwrap());
+    let report = store.status().unwrap();
+    let removed = report.rooms.iter().find(|r| r.room_id == ROOM2).unwrap();
+    assert!(!removed.configured, "removed config must not look current");
+}
+
+#[test]
+fn discovery_pages_are_bounded_and_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+    for (index, room) in [ROOM, ROOM2, ROOM3].iter().enumerate() {
+        store
+            .register_configured_room(room, None, index as i64)
+            .unwrap();
+        let mut update = room_update(room);
+        update.timeline = vec![message(&format!("$live{index}"), 100, "live")];
+        update.prev_batch = Some(format!("p{index}"));
+        store
+            .apply_sync_batch(
+                &sync_batch(&format!("s{index}"), vec![update]),
+                (index + 1) as i64,
+            )
+            .unwrap();
+    }
+    let conn = db(&path);
+    for index in 0..20 {
+        conn.execute(
+            "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status)
+             VALUES (?1, ?2, 'limited_sync', 'b', ?3, ?3, 'open')",
+            rusqlite::params![ROOM, index, format!("g{index}")],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    assert_eq!(store.bases_needing_history_page(None, 2).unwrap().len(), 2);
+    let newest = store.bases_needing_history_newest(2).unwrap();
+    assert_eq!(newest.len(), 2);
+    assert_eq!(newest[0].room_id, ROOM3, "newest activity first");
+    let first_gaps = store.open_gap_positions_page(None, 5).unwrap();
+    assert_eq!(first_gaps.len(), 5);
+    let after = first_gaps.last().unwrap().gap_id;
+    let next_gaps = store.open_gap_positions_page(Some(after), 5).unwrap();
+    assert_eq!(next_gaps.len(), 5);
+    assert!(next_gaps[0].gap_id > after);
+    let newest_gaps = store.open_gap_positions_newest(3).unwrap();
+    assert!(newest_gaps[0].gap_id > newest_gaps[1].gap_id);
+}
+
+#[test]
+fn retry_stalled_only_re_enables_eligible_configured_rooms() {
+    const ROOM4: &str = "!room4:hs.example.org";
+    const ROOM5: &str = "!room5:hs.example.org";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let seed = |store: &mut mainlinenerd_ingest::store::Store,
+                room: &str,
+                state: Vec<serde_json::Value>,
+                token: &str,
+                batch: &str| {
+        store.register_configured_room(room, None, 1).unwrap();
+        let mut update = room_update(room);
+        update.state = state;
+        update.timeline = vec![message(&format!("$live-{room}"), 100, "live")];
+        update.prev_batch = Some(token.to_owned());
+        store
+            .apply_sync_batch(&sync_batch(batch, vec![update]), 10)
+            .unwrap();
+    };
+
+    // Eligible A: stalled base with a saved cursor.
+    seed(&mut store, ROOM, vec![create_room("11")], "p1", "s1");
+    store.mark_history_stalled(ROOM, "403", 20).unwrap();
+    // Encrypted B.
+    seed(
+        &mut store,
+        ROOM2,
+        vec![create_room("11"), encryption_event()],
+        "q1",
+        "s2",
+    );
+    store.mark_history_stalled(ROOM2, "403", 20).unwrap();
+    // Versionless (not ready) C.
+    seed(&mut store, ROOM3, vec![], "r1", "s3");
+    store.mark_history_stalled(ROOM3, "403", 20).unwrap();
+    // Departed D.
+    store.register_configured_room(ROOM4, None, 1).unwrap();
+    let mut departed = room_update(ROOM4);
+    departed.state = vec![create_room("11")];
+    departed.timeline = vec![message("$live-departed", 100, "live")];
+    departed.prev_batch = Some("t1".to_owned());
+    departed.own_membership = Some("leave".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s4", vec![departed]), 10)
+        .unwrap();
+    store.mark_history_stalled(ROOM4, "403", 20).unwrap();
+    // Completed E must never be reopened.
+    seed(&mut store, ROOM5, vec![create_room("11")], "u1", "s5");
+    let completed = store
+        .apply_history_page(
+            ROOM5,
+            HistoryWork::Base,
+            "u1",
+            &history_page("u1", None, vec![]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(completed.status, Some(HistoryStatus::Completed));
+
+    // An open gap with a stale error note, a bounded gap that fails 403
+    // (unresolved but with saved cursor+boundary), a cursor-less unresolved
+    // gap, and a repaired gap.
+    let open_gap_id;
+    let failed_gap_id;
+    let bounded_gap_id;
+    {
+        let conn = db(&path);
+        conn.execute(
+            "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status)
+             VALUES (?1, 1, 'limited_sync', 'b', 'open-upper', 'open-cursor', 'open')",
+            rusqlite::params![ROOM],
+        )
+        .unwrap();
+        open_gap_id = scalar_i64(&conn, "SELECT MAX(gap_id) FROM gap_jobs");
+        conn.execute(
+            "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status, close_reason)
+             VALUES (?1, 1, 'limited_sync', 'b', 'failed-upper', 'failed-cursor', 'unresolved', 'room unavailable: 403')",
+            rusqlite::params![ROOM],
+        )
+        .unwrap();
+        failed_gap_id = scalar_i64(&conn, "SELECT MAX(gap_id) FROM gap_jobs");
+        conn.execute(
+            "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status, close_reason)
+             VALUES (?1, 1, 'limited_sync', 'b', 'no-token-upper', NULL, 'unresolved', 'no repair token available')",
+            rusqlite::params![ROOM],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status)
+             VALUES (?1, 1, 'limited_sync', 'b', 'done-upper', 'done-cursor', 'open')",
+            rusqlite::params![ROOM],
+        )
+        .unwrap();
+        bounded_gap_id = scalar_i64(&conn, "SELECT MAX(gap_id) FROM gap_jobs");
+        conn.execute(
+            "INSERT INTO history_visited (room_id, work_kind, work_id, token, visited_at)
+             VALUES (?1, 'gap', ?2, 'failed-cursor', 5)",
+            rusqlite::params![ROOM, failed_gap_id],
+        )
+        .unwrap();
+    }
+    store.record_gap_error(open_gap_id, "transient").unwrap();
+    // Repair the last gap so it must never be reopened.
+    let repaired = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(bounded_gap_id),
+            "done-cursor",
+            &history_page("done-cursor", Some("b"), vec![]),
+            35,
+        )
+        .unwrap();
+    assert_eq!(repaired.status, Some(HistoryStatus::Completed));
+
+    let retried = store.retry_stalled_configured(40).unwrap();
+    assert_eq!(
+        retried,
+        mainlinenerd_ingest::store::RetryStalledOutcome { base: 1, gaps: 1 },
+        "one base and one bounded gap are resumed; notes are not counted"
+    );
+    assert_eq!(retried.total(), 2);
+    assert!(!store.room_history_stalled(ROOM).unwrap());
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+    for room in [ROOM2, ROOM3, ROOM4] {
+        assert!(
+            store.room_history_stalled(room).unwrap(),
+            "{room} keeps its stall"
+        );
+    }
+    assert!(store.room_history_complete(ROOM5).unwrap());
+    assert!(!store.room_history_stalled(ROOM5).unwrap());
+
+    // The 403'd bounded gap is resumable at exactly its saved from/to, with its
+    // ledger intact.
+    let reopened = store
+        .open_gap_position(failed_gap_id)
+        .unwrap()
+        .expect("the bounded gap is open again");
+    assert_eq!(reopened.token, "failed-cursor");
+    assert_eq!(reopened.to_token.as_deref(), Some("b"));
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(
+            &conn,
+            &format!("SELECT upper_token FROM gap_jobs WHERE gap_id = {failed_gap_id}")
+        ),
+        Some("failed-upper".to_owned()),
+        "the upper boundary is preserved"
+    );
+    assert_eq!(
+        scalar_string(
+            &conn,
+            &format!("SELECT close_reason FROM gap_jobs WHERE gap_id = {failed_gap_id}")
+        ),
+        None
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM history_visited WHERE work_kind = 'gap' AND work_id = {failed_gap_id}"
+            )
+        ),
+        1,
+        "the visited-token ledger is preserved"
+    );
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT close_reason FROM gap_jobs WHERE cursor_token = 'open-cursor'"
+        ),
+        None,
+        "an open resumable gap loses only a stale note"
+    );
+    assert_eq!(
+        scalar_string(
+            &conn,
+            &format!("SELECT status FROM gap_jobs WHERE gap_id = {bounded_gap_id}")
+        ),
+        Some("repaired".to_owned()),
+        "a repaired gap is never reopened"
+    );
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT status FROM gap_jobs WHERE cursor_token IS NULL AND upper_token = 'no-token-upper'"
+        ),
+        Some("unresolved".to_owned()),
+        "a cursor-less unresolved gap is never reopened"
+    );
 }

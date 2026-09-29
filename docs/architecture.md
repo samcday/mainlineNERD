@@ -7,26 +7,34 @@ writer. No event sending, no receipts, no invites, no media download, no E2EE ke
 import, no summarizer. Text projection only: raw events are always stored, and a
 derived `current_messages` view is maintained for later LLM consumption.
 
-The real Matrix adapter is a separate task. In this checkpoint the engine's
-`Transport` trait is implemented only by the test fake, so the runtime algorithm
-(transaction boundaries, paging stalls, gap repair) is exercised without
-credentials or network.
+The live adapter is `src/matrix.rs`, built on matrix-sdk 0.19.1 and public typed
+Ruma request/response APIs (`Client::send`). The single-writer coordinator in
+`src/runtime.rs` runs one long-poll `/sync` and paced `/messages` work
+concurrently and applies every finished result through the store.
 
 ## Modules
 
 | File | Responsibility |
 | --- | --- |
 | `src/event.rs` | Wire-envelope validation, relation/edit/redaction extraction, room-version dependent redaction pruning. No Matrix state renderer. |
-| `src/store.rs` | SQLite schema, atomic batch/page commits, projection maintenance, status and JSONL export. |
-| `src/engine.rs` | `Transport` trait, sync polling, paced history pagination, error classification. No transaction is held across an `.await`. |
-| `src/main.rs` | `status`, `export`; `run`/`follow` currently fail with an explicit "adapter not implemented" error. |
+| `src/store.rs` | SQLite schema, atomic batch/page commits, projection maintenance, allowlist pins, status and JSONL export. |
+| `src/engine.rs` | `Transport` trait plus the request/apply primitives shared by the sequential driver and the concurrent coordinator. No transaction is held across an `.await`. |
+| `src/config.rs` | Validated TOML config, homeserver URL rules, storage safety and token indirection. |
+| `src/matrix.rs` | The live Matrix transport: typed `/sync`, `/messages`, `/whoami`, alias resolution, room create state and explicit joins. |
+| `src/runtime.rs` | Startup binding (`initialize`) and the concurrent sync/history coordinator with pacing, backoff and rate-limit handling. |
+| `src/main.rs` | `status`, `export`, `follow` (live sync only) and `run` (live sync plus history backfill). |
 
 ## Tables
 
 - `archive_meta` — homeserver/user/device binding, set on first open.
 - `sync_progress` — the opaque global `since` token, last success, failure count.
 - `rooms` — room id, room version, predecessor/successor, encrypted and
-  operator-action flags.
+  operator-action flags, plus `configured` (operator allowlist membership),
+  `configured_alias` (informational metadata) and `own_membership` (our own
+  last observed membership; `leave`/`ban` disables work for the room).
+- `room_pins` — the canonical room id an explicit alias resolved to when it was
+  first seen. A later resolution to a different room is refused, so alias drift
+  cannot widen the allowlist.
 - `room_history` — per-room base archival backfill cursor: opaque history token,
   `complete`, `stalled`, page count, last error. A row whose token is absent is
   honestly unseeded (not complete); a later explicit `prev_batch` may fill in a
@@ -52,8 +60,109 @@ credentials or network.
   latest winning edit, relation/thread metadata, redacted flag and redaction
   timestamp. Edits never appear as rows of their own.
 
-Application tables are independent of any matrix-sdk cache; the adapter task must
-not reuse SDK store tables.
+Application tables are independent of any matrix-sdk cache. The adapter uses a
+memory-only SDK store (the `sqlite` feature is disabled) and never reuses SDK
+store tables; our SQLite archive is the only source of truth for cursors.
+
+## Live adapter and runtime
+
+- The adapter is built from explicit config: a validated homeserver base URL
+  (HTTPS required except for loopback hosts), the expected user/device binding
+  and the room allowlist. HTTP redirects are disabled, URL credentials, query
+  strings and fragments are rejected, and the config points the client at the
+  configured homeserver rather than any link found in a message.
+- Only public typed Ruma requests via `Client::send` are used: `/sync`,
+  `/messages`, `/whoami`, `/directory/room/{alias}`, `/rooms/{id}/state/{type}`
+  and an operator-requested `/join`. E2EE and automatic key forwarding are off.
+  `RequestConfig::disable_retry()` and explicit timeouts give the owned
+  scheduler control of pacing and error accounting.
+- `/sync` is a long poll with `set_presence=offline`, a restrictive filter (only
+  allowlisted rooms; no ephemeral/account data) and a small timeline limit.
+  Server filters are an efficiency aid; the adapter additionally applies one
+  local archival-selection rule to both sync and history: only
+  `m.room.message`, `m.room.encrypted`, `m.room.redaction`, `m.room.create`,
+  `m.room.encryption` and `m.room.tombstone` are archived. Rosters, power-level
+  maps and other state are dropped whatever the server sends. Our own *current*
+  membership is extracted as control metadata from sync; backfilled membership
+  can never change it.
+- Room version is established from genuine room state. If a room has no version
+  yet, `initialize` fetches `m.room.create` and validates it strictly: a full
+  event must really be the requested `m.room.create` state event, and a content
+  object must have an absent version (v1) or an exact version this build
+  recognizes. Non-object responses, non-string versions, a present non-string
+  room id, wrong event types or state keys, unknown versions and mis-addressed
+  events leave the room unready with a bounded reason; no guessed version is
+  ever stored, and a corrected response recovers on a later start.
+- For `join = true`, the explicit operator join happens *before* metadata, since
+  a public-join or joined-history room may refuse state until the bot is a
+  member. A successful join is not permission to ingest: only validated, ready
+  rooms are admitted to the data set, and unready candidates are tracked for
+  status only. A global sync token still advances for the healthy admitted
+  scope while another candidate is deferred.
+- The runtime owns one `Engine` and therefore one SQLite writer. It polls a
+  held `/sync` future and at most one history future in a fair `select!` (no
+  plane is prioritized) and yields between iterations, so an unbounded eager
+  stream of ready sync batches cannot starve backfill, shutdown or other tasks.
+  A held long poll never blocks backfill and an active backfill never blocks a
+  live batch.
+- Pending jobs stay in SQLite and the scheduler keeps only the configured room
+  rotation plus a per-room cursor: each visit prefers the room's base work or
+  one open gap (alternating) and falls back to the other kind within the same
+  visit, so a base-only room pages back to back and a gap-only room is served
+  every visit. Gap turns alternate between a bounded newest-gap opportunity and
+  an ascending key-set rotation: a freshly opened gap is served within a couple
+  of turns while older ids still advance, and the ascending cursor is never
+  advanced by the fresh turn, so the backlog is not skipped. Memory scales with
+  the explicit room set rather than the job backlog, and continuing jobs
+  relinquish their turn. This bounds latency, not lossless throughput: what is
+  archived still depends on server and retention limits. A removed configuration
+  entry is cleared from the current allowlist and excluded from discovery and
+  status even though its historical rows remain.
+- History is paced globally (default one request per second) and served
+  round-robin across rooms and their work. Global transport outcomes are
+  classified before room eligibility: a late 401 from a room that just left
+  still halts the run and a late 429 still imposes the global cooldown on every
+  other room. Only data application and local work-item changes are rejected by
+  room eligibility; a rejected page touches no event, cursor or ledger. A global
+  cooldown is never shortened by another result (including a success or a
+  shorter hint from the other plane). Transient
+  failures back off with bounded exponential delay and jitter; a 429 honours the
+  server's `Retry-After` header (including an HTTP date) or the Matrix retry
+  hint, with an explicit conservative fallback when neither is present; a rate
+  limit always halts history before another room is attempted. Empty sync
+  responses are paced even when the token changes, and their checkpoint is
+  still committed. A 401 stops the whole run; a 403 or not-found affects only
+  that room.
+- A configured room that is idle and absent from `/sync` still gets a base
+  cursor: a never-started cursor is seeded from the committed global token.
+  In-progress, stalled and complete work is never rewound.
+- Rooms whose own membership is `leave`/`ban`, encrypted rooms and upgrade
+  successors are flagged for operator action instead of being expanded. No
+  automatic join ever follows an observed departure, and an explicit join uses
+  the pinned canonical id with the server hints returned for an alias (or
+  configured `via` hints); a join response naming another room is refused.
+- Startup is isolated per room: an alias, join or metadata failure marks only
+  that room unready (with a bounded status reason) and the others proceed, with
+  bounded retries for transient/rate-limited failures. A final exhausted retry
+  still preserves its `Retry-After`/transient pause before any later startup or
+  live request. Authentication and client build failures remain global. A
+  missing `/whoami` device id fails the dedicated-device binding clearly instead
+  of being accepted.
+- Permanent room failures stay terminal until an operator restores access. The
+  explicit `run --retry-stalled` control re-enables stalled never-completed base
+  work and reopens `unresolved` bounded gap repairs that still hold both a saved
+  cursor and a saved lower boundary, preserving both tokens, the upper boundary,
+  event data and the visited-token ledger. It is limited to currently
+  configured, still-eligible rooms, commits its base/gap changes atomically and
+  reports honest base and gap counts. It never joins, never clears membership/
+  encryption/tombstone/readiness policy, never rewrites cursors and never
+  reopens repaired/completed jobs or cursor-less/unbounded unfinished work.
+- Diagnostics are stable categories plus an HTTP status. Request URLs (which
+  carry pagination tokens), server error text, raw config snippets and the
+  access token never reach `Display`, logs, status or stderr.
+- CTRL-C drops the in-flight network futures and returns; every applied batch or
+  page was already committed, so the durable checkpoint is always valid and the
+  same positions are requested on reopen and applied exactly once.
 
 ## Transactional guarantees
 
@@ -214,7 +323,19 @@ not reuse SDK store tables.
 ## Privacy and passivity
 
 - No credentials are stored in the archive; only opaque sync/history tokens in
-  the progress tables. `status` prints neither tokens nor bodies.
+  the progress tables. `status` prints neither tokens nor bodies. The access
+  token is read from the configured environment variable at startup and is
+  wrapped so it can never appear in a `Debug` value, log line or panic message;
+  the config file stores only the variable name.
+- `initialize` validates `/whoami` against the configured user and device before
+  any room is registered or any batch applied. A missing device id is rejected
+  because this dedicated-device pilot cannot verify that binding.
+  The client is configured from the explicit homeserver and redirects are
+  disabled, so it never follows an untrusted link or credential redirect.
+- New archives and exports live under an owner-private data directory. An
+  existing data directory that is group/world accessible is refused with the
+  required `chmod 700` rather than silently widened; a missing one is created
+  `0700`. The archive must be a regular file, never a symlink.
 - Redaction removes bodies from the raw JSON that is kept, so exports cannot
   resurrect them. Encrypted rooms and room-upgrade successors are flagged for
   operator action instead of being expanded automatically.
@@ -227,13 +348,17 @@ not reuse SDK store tables.
   (including the archive itself). A newly created export is owner-only (`0600`)
   on Unix; `--out` is optional and stdout remains supported.
 
-## Known limits (this checkpoint)
+## Known limits
 
-- No live adapter: no real `/sync`, `/messages`, alias resolution, session
-  handling or retry scheduler. The engine exposes retry hints
-  (`TransportError::RateLimited { retry_after_ms }`) for the adapter driver.
-- JSONL export is available; no config file/CLI identity plumbing yet. The
-  adapter task will add `config.example.toml` and session binding at startup.
+- The adapter is read-only apart from an explicit operator-requested join of a
+  configured room. No messages, receipts, presence, typing, invites, discovery
+  crawl, media download, profile/roster archive or key requests are ever sent.
+- No E2EE: encrypted rooms are flagged and skipped, and no key import or
+  plaintext assumption is made. There is no room-upgrade history stitching and
+  no automatic follow of a successor.
+- Backfill has no arbitrary age cap but is paced; it archives what the server
+  makes accessible and does not claim global Matrix coverage or recall of
+  external copies.
 - Edit validity is structural (`m.new_content.msgtype` and `.body` present)
   rather than a full ruma re-deserialization; rich HTML sanitization is out of
   scope.

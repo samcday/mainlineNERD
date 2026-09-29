@@ -1,14 +1,24 @@
 //! Transport-independent ingestion engine.
 //!
 //! The engine owns the store and drives sync and history pagination. The real
-//! Matrix adapter will implement [`Transport`] with matrix-sdk typed requests;
-//! tests use a fake. No transaction is ever held across an `.await`: each
+//! Matrix adapter implements [`Transport`] with matrix-sdk typed requests;
+//! tests use a fake. No transaction is ever held across an `.await`; each
 //! transport call completes before the store is touched.
+//!
+//! The request/apply primitives ([`Engine::sync_request`],
+//! [`Engine::apply_sync_result`], [`Engine::base_history_request`],
+//! [`Engine::commit_history_page`], [`Engine::record_history_error`]) are split
+//! from the sequential convenience methods so a concurrent coordinator can run
+//! a long-poll `/sync` and paced `/messages` work in flight together while a
+//! single writer applies every result. Nothing here duplicates store cursor or
+//! projection logic.
 
 use async_trait::async_trait;
 
 use crate::event::{HistoryPage, SyncBatch};
-use crate::store::{HistoryStatus, HistoryWork, Store, StoreError, SyncApplyOutcome};
+use crate::store::{
+    HistoryApplyOutcome, HistoryStatus, HistoryWork, Store, StoreError, SyncApplyOutcome,
+};
 
 /// One long-poll `/sync` request.
 #[derive(Debug, Clone)]
@@ -39,6 +49,10 @@ pub enum TransportError {
     /// work item fails; later rooms must still progress.
     #[error("room unavailable: {0}")]
     RoomUnavailable(String),
+    /// A permanent, non-room-scoped failure such as an unexpected redirect or
+    /// a request that cannot be constructed. The whole run stops.
+    #[error("fatal transport error: {0}")]
+    Fatal(String),
     /// Rate limited: stop the run and back off for the hint.
     #[error("rate limited (retry_after_ms={retry_after_ms:?})")]
     RateLimited { retry_after_ms: Option<u64> },
@@ -50,6 +64,58 @@ pub enum TransportError {
 pub trait Transport: Send + Sync {
     async fn sync(&self, request: SyncRequest) -> Result<SyncBatch, TransportError>;
     async fn history(&self, request: HistoryRequest) -> Result<HistoryPage, TransportError>;
+
+    /// Whether a room is in the operator allowlist. This is the runtime's own
+    /// boundary; it does not rely on anything the server sends. Transports
+    /// without an allowlist (test fakes) allow everything.
+    fn is_allowed_room(&self, _room_id: &str) -> bool {
+        true
+    }
+}
+
+/// One history work item that currently deserves a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingHistory {
+    Base { room_id: String },
+    Gap { gap_id: i64, room_id: String },
+}
+
+impl PendingHistory {
+    pub fn work(&self) -> HistoryWork {
+        match self {
+            PendingHistory::Base { .. } => HistoryWork::Base,
+            PendingHistory::Gap { gap_id, .. } => HistoryWork::Gap(*gap_id),
+        }
+    }
+
+    pub fn room_id(&self) -> &str {
+        match self {
+            PendingHistory::Base { room_id } | PendingHistory::Gap { room_id, .. } => room_id,
+        }
+    }
+}
+
+/// How a fetched page was applied. `counted` is false for a stale response,
+/// which changes nothing and is never described as committed work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedHistoryPage {
+    pub outcome: HistoryApplyOutcome,
+    pub counted: bool,
+    pub events_stored: u64,
+}
+
+/// How a room-scoped history failure was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFailure {
+    /// Transient: the work item stays queued, the caller should back off.
+    Deferred,
+    /// Permanently unavailable for this room only; other rooms continue.
+    Unavailable,
+    /// Authentication/fatal: the whole run must stop.
+    Authentication,
+    /// Rate limited with an optional server hint; the caller must back off and
+    /// must not touch another room immediately.
+    RateLimited { retry_after_ms: Option<u64> },
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +236,18 @@ impl<T: Transport> Engine<T> {
         &self.transport
     }
 
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// Build the next long-poll request from the owned committed token.
+    pub fn sync_request(&self) -> Result<SyncRequest, StoreError> {
+        Ok(SyncRequest {
+            since: self.store.since_token()?,
+            timeout_ms: self.config.sync_timeout_ms,
+        })
+    }
+
     /// Run one sync poll. Success commits events plus the `next_batch` token
     /// atomically. Permanent errors abort; transient errors and rate limits are
     /// returned so the caller can back off.
@@ -177,11 +255,20 @@ impl<T: Transport> Engine<T> {
         &mut self,
         received_at: i64,
     ) -> Result<SyncPollOutcome, EngineError> {
-        let request = SyncRequest {
-            since: self.store.since_token()?,
-            timeout_ms: self.config.sync_timeout_ms,
-        };
-        match self.transport.sync(request).await {
+        let request = self.sync_request()?;
+        let result = self.transport.sync(request).await;
+        self.apply_sync_result(result, received_at)
+    }
+
+    /// Apply one finished `/sync` request result. This is the single place
+    /// where a batch commits, so both the sequential driver and the concurrent
+    /// coordinator share identical commit and error-accounting behavior.
+    pub fn apply_sync_result(
+        &mut self,
+        result: Result<SyncBatch, TransportError>,
+        received_at: i64,
+    ) -> Result<SyncPollOutcome, EngineError> {
+        match result {
             Ok(batch) => {
                 let outcome = self.store.apply_sync_batch(&batch, received_at)?;
                 Ok(SyncPollOutcome::Applied(outcome))
@@ -195,10 +282,124 @@ impl<T: Transport> Engine<T> {
                 Ok(SyncPollOutcome::TransientFailure { message })
             }
             Err(
-                error @ (TransportError::Authentication(_) | TransportError::RoomUnavailable(_)),
+                error @ (TransportError::Authentication(_)
+                | TransportError::RoomUnavailable(_)
+                | TransportError::Fatal(_)),
             ) => {
                 self.store.record_sync_failure(&error.to_string())?;
                 Err(EngineError::Transport(error))
+            }
+        }
+    }
+
+    /// Build the next base backfill request for a room, or `None` when that
+    /// work item is complete, stalled or has no usable cursor. The eligibility
+    /// check is the store's own durable state, so a stalled or completed base
+    /// is never fetched.
+    pub fn base_history_request(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<HistoryRequest>, StoreError> {
+        if self.store.room_history_complete(room_id)? || self.store.room_history_stalled(room_id)? {
+            return Ok(None);
+        }
+        let Some(token) = self.store.room_history_token(room_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(HistoryRequest {
+            room_id: room_id.to_owned(),
+            from: token,
+            to: None,
+            limit: self.config.history_limit,
+        }))
+    }
+
+    /// Build the next bounded gap-repair request for one open job, or `None`
+    /// when the job is closed or has no cursor.
+    pub fn gap_history_request(&self, gap_id: i64) -> Result<Option<HistoryRequest>, StoreError> {
+        Ok(self
+            .store
+            .open_gap_position(gap_id)?
+            .map(|gap| HistoryRequest {
+                room_id: gap.room_id,
+                from: gap.token,
+                to: gap.to_token,
+                limit: self.config.history_limit,
+            }))
+    }
+
+    /// Commit one finished `/messages` page against the work item its request
+    /// was built for. A stale response changes nothing and is not counted.
+    pub fn commit_history_page(
+        &mut self,
+        work: HistoryWork,
+        request: &HistoryRequest,
+        page: HistoryPage,
+        received_at: i64,
+    ) -> Result<CommittedHistoryPage, EngineError> {
+        let outcome = self.store.apply_history_page(
+            &request.room_id,
+            work,
+            &request.from,
+            &page,
+            received_at,
+        )?;
+        let counted = !matches!(outcome.status, Some(HistoryStatus::Stale));
+        let events_stored = if counted {
+            outcome.events_seen.saturating_sub(outcome.events_duplicate)
+        } else {
+            0
+        };
+        Ok(CommittedHistoryPage {
+            outcome,
+            counted,
+            events_stored,
+        })
+    }
+
+    /// Record a room-scoped history failure on the work item that actually
+    /// failed and classify it. Transient errors are recorded on the work item
+    /// (base or gap) without touching the other; a room-local permanent failure
+    /// stalls only that work item; rate limits and authentication do not write
+    /// a terminal state, so the caller owns the global decision.
+    pub fn record_history_error(
+        &mut self,
+        work: HistoryWork,
+        room_id: &str,
+        error: &TransportError,
+        received_at: i64,
+    ) -> Result<HistoryFailure, EngineError> {
+        match error {
+            TransportError::Authentication(_) | TransportError::Fatal(_) => {
+                Ok(HistoryFailure::Authentication)
+            }
+            TransportError::RateLimited { retry_after_ms } => Ok(HistoryFailure::RateLimited {
+                retry_after_ms: *retry_after_ms,
+            }),
+            TransportError::Transient(_) => {
+                match work {
+                    HistoryWork::Gap(gap_id) => {
+                        self.store.record_gap_error(gap_id, &error.to_string())?
+                    }
+                    HistoryWork::Base => {
+                        self.store
+                            .record_history_error(room_id, &error.to_string(), received_at)?
+                    }
+                }
+                Ok(HistoryFailure::Deferred)
+            }
+            TransportError::RoomUnavailable(_) => {
+                match work {
+                    HistoryWork::Gap(gap_id) => {
+                        self.store
+                            .mark_gap_unresolved(gap_id, &error.to_string(), received_at)?
+                    }
+                    HistoryWork::Base => {
+                        self.store
+                            .mark_history_stalled(room_id, &error.to_string(), received_at)?
+                    }
+                }
+                Ok(HistoryFailure::Unavailable)
             }
         }
     }
@@ -230,9 +431,9 @@ impl<T: Transport> Engine<T> {
                     outcome.events_stored += failure.events_stored;
                     match failure.error {
                         EngineError::Transport(error) => {
-                            if !self.handle_history_error(
+                            if !self.apply_run_history_failure(
+                                HistoryWork::Base,
                                 &position.room_id,
-                                None,
                                 &error,
                                 received_at,
                                 &mut outcome,
@@ -262,9 +463,9 @@ impl<T: Transport> Engine<T> {
                     outcome.events_stored += failure.events_stored;
                     match failure.error {
                         EngineError::Transport(error) => {
-                            if !self.handle_history_error(
+                            if !self.apply_run_history_failure(
+                                HistoryWork::Gap(gap.gap_id),
                                 &gap.room_id,
-                                Some(gap.gap_id),
                                 &error,
                                 received_at,
                                 &mut outcome,
@@ -279,6 +480,40 @@ impl<T: Transport> Engine<T> {
         }
 
         Ok(outcome)
+    }
+
+    /// Classify a run-level history failure. `Ok(true)` means the run can
+    /// continue with other work items, `Ok(false)` means it should stop early
+    /// with a rate limit recorded, and `Err` is reserved for authentication
+    /// failure, carrying the committed partial outcome.
+    fn apply_run_history_failure(
+        &mut self,
+        work: HistoryWork,
+        room_id: &str,
+        error: &TransportError,
+        received_at: i64,
+        outcome: &mut HistoryRunOutcome,
+    ) -> Result<bool, EngineError> {
+        match self.record_history_error(work, room_id, error, received_at)? {
+            HistoryFailure::Authentication => Err(EngineError::HistoryAborted {
+                source: error.clone(),
+                partial: Box::new(outcome.clone()),
+            }),
+            HistoryFailure::RateLimited { retry_after_ms } => {
+                outcome.rate_limited = true;
+                outcome.retry_after_ms = outcome.retry_after_ms.or(retry_after_ms);
+                outcome.items_deferred += 1;
+                Ok(false)
+            }
+            HistoryFailure::Deferred => {
+                outcome.items_deferred += 1;
+                Ok(true)
+            }
+            HistoryFailure::Unavailable => {
+                outcome.items_failed += 1;
+                Ok(true)
+            }
+        }
     }
 
     /// Advance one room's base archival backfill. Stops on completion, on a
@@ -312,7 +547,7 @@ impl<T: Transport> Engine<T> {
         received_at: i64,
         outcome: &mut RoomHistoryOutcome,
     ) -> Result<(), EngineError> {
-        while (outcome.pages_fetched as usize) < self.config.max_pages_per_room {
+        loop {
             if self.store.room_history_complete(room_id)? {
                 outcome.completed = true;
                 break;
@@ -323,36 +558,29 @@ impl<T: Transport> Engine<T> {
                 outcome.stalled = true;
                 break;
             }
-            let Some(token) = self.store.room_history_token(room_id)? else {
+            let Some(request) = self.base_history_request(room_id)? else {
                 break;
             };
 
-            let page = self
-                .transport
-                .history(HistoryRequest {
-                    room_id: room_id.to_owned(),
-                    from: token.clone(),
-                    to: None,
-                    limit: self.config.history_limit,
-                })
-                .await?;
-
-            let applied = self.store.apply_history_page(
-                room_id,
-                HistoryWork::Base,
-                &token,
-                &page,
-                received_at,
-            )?;
-            // A stale response changed nothing and is not a committed page.
-            if !matches!(applied.status, Some(HistoryStatus::Stale)) {
+            let result = self.transport.history(request.clone()).await;
+            let page = match result {
+                Ok(page) => page,
+                Err(error) => return Err(EngineError::Transport(error)),
+            };
+            let applied =
+                self.commit_history_page(HistoryWork::Base, &request, page, received_at)?;
+            if applied.counted {
                 outcome.pages_fetched += 1;
-                outcome.events_stored +=
-                    applied.events_seen.saturating_sub(applied.events_duplicate);
+                outcome.events_stored += applied.events_stored;
             }
 
-            match applied.status {
-                Some(HistoryStatus::Advanced) => continue,
+            match applied.outcome.status {
+                Some(HistoryStatus::Advanced) => {
+                    if (outcome.pages_fetched as usize) >= self.config.max_pages_per_room {
+                        break;
+                    }
+                    continue;
+                }
                 Some(HistoryStatus::Completed) => {
                     outcome.completed = true;
                     break;
@@ -399,37 +627,31 @@ impl<T: Transport> Engine<T> {
         received_at: i64,
         outcome: &mut GapRepairOutcome,
     ) -> Result<(), EngineError> {
-        while (outcome.pages_fetched as usize) < self.config.max_pages_per_room {
-            let Some(gap) = self.store.open_gap_position(gap_id)? else {
+        loop {
+            let Some(request) = self.gap_history_request(gap_id)? else {
                 break;
             };
 
-            let page = self
-                .transport
-                .history(HistoryRequest {
-                    room_id: gap.room_id.clone(),
-                    from: gap.token.clone(),
-                    to: gap.to_token.clone(),
-                    limit: self.config.history_limit,
-                })
-                .await?;
-
-            let applied = self.store.apply_history_page(
-                &gap.room_id,
-                HistoryWork::Gap(gap_id),
-                &gap.token,
-                &page,
-                received_at,
-            )?;
+            let result = self.transport.history(request.clone()).await;
+            let page = match result {
+                Ok(page) => page,
+                Err(error) => return Err(EngineError::Transport(error)),
+            };
+            let applied =
+                self.commit_history_page(HistoryWork::Gap(gap_id), &request, page, received_at)?;
             // A stale response changed nothing and is not a committed page.
-            if !matches!(applied.status, Some(HistoryStatus::Stale)) {
+            if applied.counted {
                 outcome.pages_fetched += 1;
-                outcome.events_stored +=
-                    applied.events_seen.saturating_sub(applied.events_duplicate);
+                outcome.events_stored += applied.events_stored;
             }
 
-            match applied.status {
-                Some(HistoryStatus::Advanced) => continue,
+            match applied.outcome.status {
+                Some(HistoryStatus::Advanced) => {
+                    if (outcome.pages_fetched as usize) >= self.config.max_pages_per_room {
+                        break;
+                    }
+                    continue;
+                }
                 Some(HistoryStatus::Completed) => {
                     outcome.repaired = true;
                     break;
@@ -443,62 +665,6 @@ impl<T: Transport> Engine<T> {
             }
         }
         Ok(())
-    }
-
-    /// Classify a room-scoped history failure. `Ok(true)` means the run can
-    /// continue with other work items, `Ok(false)` means it should stop early
-    /// with a rate limit recorded, and `Err` is reserved for authentication
-    /// failure, carrying the committed partial outcome.
-    fn handle_history_error(
-        &self,
-        room_id: &str,
-        gap_id: Option<i64>,
-        error: &TransportError,
-        received_at: i64,
-        outcome: &mut HistoryRunOutcome,
-    ) -> Result<bool, EngineError> {
-        match error {
-            TransportError::Authentication(_) => Err(EngineError::HistoryAborted {
-                source: error.clone(),
-                partial: Box::new(outcome.clone()),
-            }),
-            TransportError::RateLimited { retry_after_ms } => {
-                outcome.rate_limited = true;
-                outcome.retry_after_ms = outcome.retry_after_ms.or(*retry_after_ms);
-                outcome.items_deferred += 1;
-                Ok(false)
-            }
-            TransportError::Transient(_) => {
-                // Attribute the failure to the work item that actually failed;
-                // base backfill's own error column is never used for a gap.
-                match gap_id {
-                    Some(gap_id) => self.store.record_gap_error(gap_id, &error.to_string())?,
-                    None => {
-                        self.store
-                            .record_history_error(room_id, &error.to_string(), received_at)?
-                    }
-                }
-                outcome.items_deferred += 1;
-                Ok(true)
-            }
-            TransportError::RoomUnavailable(_) => {
-                match gap_id {
-                    Some(gap_id) => {
-                        self.store
-                            .mark_gap_unresolved(gap_id, &error.to_string(), received_at)?;
-                    }
-                    None => {
-                        self.store.mark_history_stalled(
-                            room_id,
-                            &error.to_string(),
-                            received_at,
-                        )?;
-                    }
-                }
-                outcome.items_failed += 1;
-                Ok(true)
-            }
-        }
     }
 }
 

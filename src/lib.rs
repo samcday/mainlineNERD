@@ -1,9 +1,12 @@
 //! mainlineNERD passive Matrix ingestion.
 //!
-//! This crate contains the ingestion MVP: a durable SQLite event archive with a
-//! transport-agnostic engine. The real Matrix adapter (matrix-sdk) is a
-//! separate, not-yet-implemented piece; see `docs/architecture.md`.
+//! A durable SQLite event archive, a transport-agnostic engine, a live
+//! matrix-sdk transport and a single-writer runtime that keeps one long-poll
+//! `/sync` and paced `/messages` backfill concurrently in flight.
 
+pub mod config;
 pub mod engine;
 pub mod event;
+pub mod matrix;
+pub mod runtime;
 pub mod store;

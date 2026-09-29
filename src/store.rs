@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::event::{self, HistoryPage, NormalizedEvent, Source, SyncBatch};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Stall reason for a page whose `end` equals the token it was requested from.
 const REPEATED_TOKEN_REASON: &str = "history pagination returned a repeated token";
@@ -61,6 +61,15 @@ pub enum StoreError {
     },
     #[error("room {0} is not known to this archive")]
     UnknownRoom(String),
+    #[error(
+        "room alias {alias} is pinned to {pinned} but now resolves to {resolved}; \
+         refusing to change the allowlist"
+    )]
+    AliasDrift {
+        alias: String,
+        pinned: String,
+        resolved: String,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -116,7 +125,17 @@ CREATE TABLE rooms (
   encrypted INTEGER NOT NULL DEFAULT 0,
   needs_operator_action INTEGER NOT NULL DEFAULT 0,
   action_note TEXT,
+  configured INTEGER NOT NULL DEFAULT 0,
+  configured_alias TEXT,
+  own_membership TEXT,
+  metadata_error TEXT,
   updated_at INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE room_pins (
+  alias TEXT PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  pinned_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 
 CREATE TABLE room_history (
@@ -235,6 +254,20 @@ pub struct HistoryApplyOutcome {
     pub status: Option<HistoryStatus>,
 }
 
+/// An honest count of what an explicit retry-stalled pass actually resumed:
+/// base work items re-enabled and bounded gap repairs reopened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RetryStalledOutcome {
+    pub base: u64,
+    pub gaps: u64,
+}
+
+impl RetryStalledOutcome {
+    pub fn total(self) -> u64 {
+        self.base + self.gaps
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LiveHealth {
     pub since_token_set: bool,
@@ -251,6 +284,17 @@ pub struct RoomStatus {
     pub needs_operator_action: bool,
     pub action_note: Option<String>,
     pub successor_room_id: Option<String>,
+    /// The room is in the operator-configured allowlist.
+    pub configured: bool,
+    /// Our own membership as observed from room state, if known.
+    pub own_membership: Option<String>,
+    /// Work must not be scheduled for this room: our own membership is
+    /// `leave` or `ban`.
+    pub inactive: bool,
+    /// Bounded reason this room is not ready for version-dependent ingestion
+    /// (for example invalid or unsupported `m.room.create` metadata). Cleared
+    /// once a valid room version is established.
+    pub metadata_error: Option<String>,
     pub events: i64,
     pub messages: i64,
     pub history_token_set: bool,
@@ -442,6 +486,216 @@ impl Store {
         bound.ok_or(StoreError::Unbound).map(|_| ())
     }
 
+    /// Register one operator-configured room in the allowlist. Safe to call on
+    /// every start: the alias metadata is informational, the exact room id is
+    /// the identity, and this never creates history work by itself.
+    pub fn register_configured_room(
+        &self,
+        room_id: &str,
+        alias: Option<&str>,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO rooms (room_id, configured, configured_alias, updated_at)
+             VALUES (?1, 1, ?2, ?3)
+             ON CONFLICT(room_id) DO UPDATE SET
+               configured = 1,
+               configured_alias = COALESCE(excluded.configured_alias, rooms.configured_alias),
+               updated_at = excluded.updated_at",
+            params![room_id, alias, at],
+        )?;
+        Ok(())
+    }
+
+    /// The canonical room id an alias is pinned to, if any.
+    pub fn alias_pin(&self, alias: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT room_id FROM room_pins WHERE alias = ?1",
+                params![alias],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Pin an alias to its resolved room id. A later resolution to a different
+    /// room is refused so alias drift cannot silently widen the allowlist.
+    pub fn pin_alias(&self, alias: &str, room_id: &str, at: i64) -> Result<(), StoreError> {
+        if let Some(pinned) = self.alias_pin(alias)? {
+            if pinned != room_id {
+                return Err(StoreError::AliasDrift {
+                    alias: alias.to_owned(),
+                    pinned,
+                    resolved: room_id.to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO room_pins (alias, room_id, pinned_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(alias) DO NOTHING",
+            params![alias, room_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Our own membership in a room as last observed from room state.
+    pub fn own_membership(&self, room_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT own_membership FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Whether new work may be scheduled for a room. A room whose own
+    /// membership is `leave` or `ban` is inactive until an operator acts; it is
+    /// never silently rejoined.
+    pub fn room_active(&self, room_id: &str) -> Result<bool, StoreError> {
+        Ok(!matches!(
+            self.own_membership(room_id)?.as_deref(),
+            Some("leave" | "ban")
+        ))
+    }
+
+    pub fn room_version_of(&self, room_id: &str) -> Result<Option<String>, StoreError> {
+        room_version(&self.conn, room_id)
+    }
+
+    /// Whether this room is in the current operator allowlist.
+    pub fn room_configured(&self, room_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT configured FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// The bounded reason this room is not ready for version-dependent
+    /// ingestion, if any.
+    pub fn room_metadata_error(&self, room_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT metadata_error FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// The coherent mutable-policy rule for history work: our membership is not
+    /// `leave`/`ban`, the room is not encrypted and it has no known successor.
+    /// It is applied both when scheduling work and when accepting a finished
+    /// page, so a held response cannot revive a room that a later sync disabled.
+    pub fn room_history_allowed(&self, room_id: &str) -> Result<bool, StoreError> {
+        let row: Option<(bool, bool, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT encrypted, successor_room_id IS NOT NULL, own_membership FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((encrypted, upgraded, membership)) => {
+                !encrypted && !upgraded && !matches!(membership.as_deref(), Some("leave" | "ban"))
+            }
+            None => true,
+        })
+    }
+
+    /// Record a bounded, sanitized reason a room's metadata is unusable. The
+    /// room is not given a guessed version and is not scheduled until a valid
+    /// bootstrap succeeds.
+    pub fn record_room_metadata_error(
+        &self,
+        room_id: &str,
+        reason: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO rooms (room_id, metadata_error, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(room_id) DO UPDATE SET
+               metadata_error = excluded.metadata_error,
+               updated_at = excluded.updated_at",
+            params![room_id, reason, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_room_metadata_error(&self, room_id: &str, at: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE rooms SET metadata_error = NULL, updated_at = ?2 WHERE room_id = ?1",
+            params![room_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Make `room_ids` the current operator allowlist: mark those configured
+    /// and clear the flag on every other row, so a removed configuration entry
+    /// is excluded from current work discovery and status even though its
+    /// historical archive rows remain.
+    pub fn set_configured_rooms(&self, room_ids: &[String], at: i64) -> Result<(), StoreError> {
+        self.conn
+            .execute("UPDATE rooms SET configured = 0 WHERE configured = 1", [])?;
+        for room_id in room_ids {
+            self.register_configured_room(room_id, None, at)?;
+        }
+        Ok(())
+    }
+
+    /// Apply room policy and store control state events fetched from a
+    /// metadata endpoint (for example `GET /rooms/{id}/state/m.room.create`).
+    /// These are real state events, never fabricated ones.
+    pub fn apply_room_control_state(
+        &mut self,
+        room_id: &str,
+        events: &[Value],
+        received_at: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut outcome = SyncApplyOutcome::default();
+        apply_room_values(&tx, room_id, &[], events, None, received_at, &mut outcome)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record an already-validated room version established from content-only
+    /// metadata. This is an explicit control-metadata contract: no
+    /// `m.room.create` event is invented, and the caller must never pass a
+    /// guessed default. A room whose version is fixed this way is ready.
+    pub fn set_room_version_control(
+        &self,
+        room_id: &str,
+        version: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO rooms (room_id, room_version, metadata_error, updated_at)
+             VALUES (?1, ?2, NULL, ?3)
+             ON CONFLICT(room_id) DO UPDATE SET
+               room_version = COALESCE(rooms.room_version, excluded.room_version),
+               metadata_error = CASE WHEN rooms.room_version IS NULL THEN NULL
+                                     ELSE rooms.metadata_error END,
+               updated_at = excluded.updated_at",
+            params![room_id, version, at],
+        )?;
+        Ok(())
+    }
+
     /// The persisted `since` token, if any.
     pub fn since_token(&self) -> Result<Option<String>, StoreError> {
         Ok(self
@@ -546,6 +800,13 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !room_exists(&tx, room_id)? {
             return Err(StoreError::UnknownRoom(room_id.to_owned()));
+        }
+        // The mutable-policy rule is rechecked here, at commit, not only when
+        // work was scheduled: a held page must not revive a room that a later
+        // sync flagged (own leave/ban, encryption, upgrade). The whole
+        // response is stale, so no event, cursor or ledger entry changes.
+        if !room_history_allowed_conn(&tx, room_id)? {
+            return Ok(stale_outcome());
         }
 
         // Validate the work item before storing anything, so a stale response
@@ -712,6 +973,61 @@ impl Store {
         close_gap(&self.conn, gap_id, "unresolved", reason, at)
     }
 
+    /// Explicit one-shot operator recovery after access/membership was restored
+    /// outside this tool.
+    ///
+    /// For rooms that are currently configured and still eligible (version
+    /// known, no metadata/encryption/tombstone/leave/ban block) it:
+    /// - re-enables stalled, never-completed base work at its SAVED cursor;
+    /// - reopens `unresolved` bounded gap repairs that still hold both a saved
+    ///   cursor and a saved lower boundary, preserving both tokens, the upper
+    ///   boundary, event data and the visited-token ledger;
+    /// - clears only a stale error note on already-open gaps (that is status
+    ///   hygiene, not a resumed work item, and is not counted).
+    ///
+    /// Nothing is advanced, rewound or invented; repaired/completed jobs and
+    /// cursor-less or unbounded unresolved gaps stay terminal; no membership or
+    /// policy flag is changed; no join is performed. Base, open-gap and reopen
+    /// changes commit atomically.
+    pub fn retry_stalled_configured(&mut self, at: i64) -> Result<RetryStalledOutcome, StoreError> {
+        let eligible = "SELECT room_id FROM rooms WHERE configured = 1
+                          AND encrypted = 0 AND successor_room_id IS NULL
+                          AND room_version IS NOT NULL AND metadata_error IS NULL
+                          AND (own_membership IS NULL OR own_membership NOT IN ('leave','ban'))";
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let base = tx.execute(
+            &format!(
+                "UPDATE room_history SET stalled = 0, last_error = NULL, updated_at = ?1
+                 WHERE stalled = 1 AND complete = 0 AND token IS NOT NULL
+                   AND room_id IN ({eligible})"
+            ),
+            params![at],
+        )?;
+        tx.execute(
+            &format!(
+                "UPDATE gap_jobs SET close_reason = NULL
+                 WHERE status = 'open' AND room_id IN ({eligible})"
+            ),
+            [],
+        )?;
+        let gaps = tx.execute(
+            &format!(
+                "UPDATE gap_jobs SET status = 'open', closed_at = NULL, close_reason = NULL
+                 WHERE status = 'unresolved'
+                   AND cursor_token IS NOT NULL AND boundary_token IS NOT NULL
+                   AND room_id IN ({eligible})"
+            ),
+            [],
+        )?;
+        tx.commit()?;
+        Ok(RetryStalledOutcome {
+            base: base as u64,
+            gaps: gaps as u64,
+        })
+    }
+
     /// Rooms with a usable history token that are not complete or stalled,
     /// oldest activity first.
     pub fn rooms_needing_history(&self) -> Result<Vec<HistoryPosition>, StoreError> {
@@ -754,6 +1070,207 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// A bounded page of base backfill rooms ordered by room id, strictly after
+    /// `after` (or from the beginning when `None`). This keeps discovery memory
+    /// independent of how many rooms or jobs the archive holds.
+    pub fn bases_needing_history_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistoryPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT room_id, token FROM room_history
+             WHERE complete = 0 AND stalled = 0 AND token IS NOT NULL
+               AND (?1 IS NULL OR room_id > ?1)
+             ORDER BY room_id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after, limit as i64], |row| {
+            Ok(HistoryPosition {
+                room_id: row.get(0)?,
+                token: row.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Currently configured room ids, ordered by id. This is the candidate
+    /// scope for the runtime's per-room scheduler; readiness/policy are still
+    /// checked separately before any request or commit.
+    pub fn configured_room_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT room_id FROM rooms WHERE configured = 1 ORDER BY room_id")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One open gap job of a room, ordered by gap id strictly after `after`
+    /// (or from the start when `None`). One key-set query per turn keeps the
+    /// scheduler's state bounded by the configured rooms, not the backlog.
+    pub fn open_gap_positions_for_room_page(
+        &self,
+        room_id: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<GapPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gap_id, room_id, cursor_token, boundary_token FROM gap_jobs
+             WHERE room_id = ?1 AND status = 'open' AND cursor_token IS NOT NULL
+               AND (?2 IS NULL OR gap_id > ?2)
+             ORDER BY gap_id ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![room_id, after, limit as i64], |row| {
+            Ok(GapPosition {
+                gap_id: row.get(0)?,
+                room_id: row.get(1)?,
+                token: row.get(2)?,
+                to_token: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The newest open gap job of a room (highest gap id), used as a bounded
+    /// fresh-work opportunity so a newly opened gap never waits behind a long
+    /// running backlog.
+    pub fn open_gap_positions_for_room_newest(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<Vec<GapPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gap_id, room_id, cursor_token, boundary_token FROM gap_jobs
+             WHERE room_id = ?1 AND status = 'open' AND cursor_token IS NOT NULL
+             ORDER BY gap_id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![room_id, limit as i64], |row| {
+            Ok(GapPosition {
+                gap_id: row.get(0)?,
+                room_id: row.get(1)?,
+                token: row.get(2)?,
+                to_token: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The most recently seeded/advanced base backfill rooms, newest first.
+    /// Used to pick up newly ready rooms promptly without scanning the archive.
+    pub fn bases_needing_history_newest(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<HistoryPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT room_id, token FROM room_history
+             WHERE complete = 0 AND stalled = 0 AND token IS NOT NULL
+             ORDER BY COALESCE(updated_at, 0) DESC, room_id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(HistoryPosition {
+                room_id: row.get(0)?,
+                token: row.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The newest open gap jobs, highest gap id first.
+    pub fn open_gap_positions_newest(&self, limit: usize) -> Result<Vec<GapPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gap_id, room_id, cursor_token, boundary_token FROM gap_jobs
+             WHERE status = 'open' AND cursor_token IS NOT NULL
+             ORDER BY gap_id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(GapPosition {
+                gap_id: row.get(0)?,
+                room_id: row.get(1)?,
+                token: row.get(2)?,
+                to_token: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// A bounded page of open gap jobs ordered by gap id, strictly after
+    /// `after` (or from the beginning when `None`).
+    pub fn open_gap_positions_page(
+        &self,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<GapPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gap_id, room_id, cursor_token, boundary_token FROM gap_jobs
+             WHERE status = 'open' AND cursor_token IS NOT NULL
+               AND (?1 IS NULL OR gap_id > ?1)
+             ORDER BY gap_id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after, limit as i64], |row| {
+            Ok(GapPosition {
+                gap_id: row.get(0)?,
+                room_id: row.get(1)?,
+                token: row.get(2)?,
+                to_token: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Seed a never-started base cursor for a ready, currently configured room
+    /// from the committed global sync token. The global `next_batch` is a valid
+    /// `/messages` starting position for a room with no per-room `prev_batch`;
+    /// overlap with already-seen live events is deduplicated by event id.
+    ///
+    /// Only a never-started row is filled: an in-progress, stalled or complete
+    /// base backfill is never rewound, and a room that is not configured now is
+    /// never seeded.
+    pub fn seed_configured_room_history(&self, room_id: &str, at: i64) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
+             SELECT ?1, sp.since_token, 0, 0, 0, ?2 FROM sync_progress sp
+             WHERE sp.id = 1 AND sp.since_token IS NOT NULL
+               AND EXISTS (SELECT 1 FROM rooms r WHERE r.room_id = ?1 AND r.configured = 1)
+             ON CONFLICT(room_id) DO UPDATE SET
+               token = excluded.token,
+               updated_at = excluded.updated_at
+             WHERE room_history.token IS NULL
+               AND room_history.pages = 0
+               AND room_history.complete = 0
+               AND room_history.stalled = 0
+               AND excluded.token IS NOT NULL",
+            params![room_id, at],
+        )?;
+        Ok(changed > 0)
     }
 
     /// One open gap repair job, if it is still open and has a cursor.
@@ -815,6 +1332,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT r.room_id, r.room_version, r.encrypted, r.needs_operator_action, r.action_note,
                     r.successor_room_id,
+                    r.configured, r.own_membership, r.metadata_error,
                     (SELECT COUNT(*) FROM events e WHERE e.room_id = r.room_id),
                     (SELECT COUNT(*) FROM current_messages m WHERE m.room_id = r.room_id),
                     h.token IS NOT NULL, h.complete, h.stalled, h.pages, h.last_error,
@@ -827,6 +1345,8 @@ impl Store {
              ORDER BY r.room_id",
         )?;
         let rows = stmt.query_map([], |row| {
+            let own_membership: Option<String> = row.get(7)?;
+            let inactive = matches!(own_membership.as_deref(), Some("leave" | "ban"));
             Ok(RoomStatus {
                 room_id: row.get(0)?,
                 room_version: row.get(1)?,
@@ -834,16 +1354,20 @@ impl Store {
                 needs_operator_action: row.get(3)?,
                 action_note: row.get(4)?,
                 successor_room_id: row.get(5)?,
-                events: row.get(6)?,
-                messages: row.get(7)?,
-                history_token_set: row.get(8)?,
-                history_complete: row.get::<_, Option<bool>>(9)?.unwrap_or(false),
-                history_stalled: row.get::<_, Option<bool>>(10)?.unwrap_or(false),
-                history_pages: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                history_error: row.get(12)?,
-                open_gaps: row.get(13)?,
-                unresolved_gaps: row.get(14)?,
-                open_gap_error: row.get(15)?,
+                configured: row.get(6)?,
+                own_membership,
+                inactive,
+                metadata_error: row.get(8)?,
+                events: row.get(9)?,
+                messages: row.get(10)?,
+                history_token_set: row.get(11)?,
+                history_complete: row.get::<_, Option<bool>>(12)?.unwrap_or(false),
+                history_stalled: row.get::<_, Option<bool>>(13)?.unwrap_or(false),
+                history_pages: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+                history_error: row.get(15)?,
+                open_gaps: row.get(16)?,
+                unresolved_gaps: row.get(17)?,
+                open_gap_error: row.get(18)?,
             })
         })?;
         let mut rooms = Vec::new();
@@ -988,11 +1512,23 @@ impl Store {
             if room.successor_room_id.is_some() {
                 flags.push("upgraded".to_owned());
             }
+            if room.inactive {
+                flags.push(format!(
+                    "inactive(membership={})",
+                    room.own_membership.as_deref().unwrap_or("?")
+                ));
+            } else if let Some(membership) = room.own_membership.as_deref() {
+                flags.push(format!("membership={membership}"));
+            }
+            if let Some(error) = room.metadata_error.as_deref() {
+                flags.push(format!("not-ready({error})"));
+            }
             let _ = writeln!(
                 out,
-                "room {} v{} events={} messages={} history={} pages={} gaps(open={},unresolved={}{}){}",
+                "room {} v{} configured={} events={} messages={} history={} pages={} gaps(open={},unresolved={}{}){}",
                 room.room_id,
                 room.room_version.as_deref().unwrap_or("?"),
+                room.configured,
                 room.events,
                 room.messages,
                 if room.history_complete {
@@ -1116,6 +1652,26 @@ fn room_version(conn: &Connection, room_id: &str) -> Result<Option<String>, Stor
         .flatten())
 }
 
+/// The mutable-policy eligibility rule used at page commit: our own last
+/// observed membership is not `leave`/`ban`, the room is not encrypted and it
+/// has no known successor. An unknown room is treated as eligible here;
+/// callers that need the room to exist check `room_exists` separately.
+fn room_history_allowed_conn(conn: &Connection, room_id: &str) -> Result<bool, StoreError> {
+    let row: Option<(bool, bool, Option<String>)> = conn
+        .query_row(
+            "SELECT encrypted, successor_room_id IS NOT NULL, own_membership FROM rooms WHERE room_id = ?1",
+            params![room_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((encrypted, upgraded, membership)) => {
+            !encrypted && !upgraded && !matches!(membership.as_deref(), Some("leave" | "ban"))
+        }
+        None => true,
+    })
+}
+
 fn history_token(conn: &Connection, room_id: &str) -> Result<Option<String>, StoreError> {
     Ok(conn
         .query_row(
@@ -1157,32 +1713,59 @@ fn get_event_row(
         .optional()?)
 }
 
-fn apply_sync_room(
+/// Apply room policy, record our own membership control signal, store the
+/// room's events and refresh the room row. Shared by `/sync` batches and by
+/// explicit control-state fetches; it never opens a transaction itself.
+fn apply_room_values(
     conn: &Connection,
-    room: &event::SyncRoomUpdate,
-    previous_since: Option<&str>,
+    room_id: &str,
+    timeline: &[Value],
+    state: &[Value],
+    own_membership: Option<&str>,
     received_at: i64,
     outcome: &mut SyncApplyOutcome,
 ) -> Result<(), StoreError> {
-    let mut room_version = room_version(conn, &room.room_id)?;
+    let own_user: Option<String> = conn
+        .query_row("SELECT user_id FROM archive_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let mut room_version = room_version(conn, room_id)?;
     let mut predecessor_room_id = None;
     let mut successor_room_id = None;
     let mut encrypted = false;
+    let mut observed_membership = own_membership.map(str::to_owned);
 
-    let state_and_timeline = room.state.iter().chain(room.timeline.iter());
-    for value in state_and_timeline.clone() {
+    for value in state.iter().chain(timeline.iter()) {
         let Some(obj) = value.as_object() else {
             continue;
         };
         let Some(event_type) = obj.get("type").and_then(Value::as_str) else {
             continue;
         };
+        let state_key = obj.get("state_key").and_then(Value::as_str);
+        // Our own membership is a control signal from a genuine member state
+        // event, not a participant roster. Other members' events are archived
+        // only when the caller passes them; the live adapter strips them.
+        if event_type == event::ROOM_MEMBER {
+            if let Some(own) = own_user.as_deref() {
+                if state_key == Some(own) {
+                    if let Some(membership) = obj
+                        .get("content")
+                        .and_then(Value::as_object)
+                        .and_then(|content| content.get("membership"))
+                        .and_then(Value::as_str)
+                    {
+                        observed_membership = Some(membership.to_owned());
+                    }
+                }
+            }
+        }
         // Room policy is derived only from state events: the type alone is not
         // enough, the expected empty `state_key` must be present. A plain
         // timeline event bearing one of these types is not a state change, and
         // an isolated `m.room.encrypted` payload never enables room-wide E2EE.
-        let is_state = obj.get("state_key").and_then(Value::as_str) == Some("");
-        if !is_state {
+        if state_key != Some("") {
             continue;
         }
         match event_type {
@@ -1200,7 +1783,7 @@ fn apply_sync_room(
                             Some(version) => room_version = Some(version.to_owned()),
                             None => {
                                 return Err(StoreError::MalformedRoomVersion {
-                                    room_id: room.room_id.clone(),
+                                    room_id: room_id.to_owned(),
                                 });
                             }
                         },
@@ -1239,8 +1822,8 @@ fn apply_sync_room(
 
     conn.execute(
         "INSERT INTO rooms (room_id, room_version, predecessor_room_id, successor_room_id, encrypted,
-                            needs_operator_action, action_note, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                            needs_operator_action, action_note, own_membership, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(room_id) DO UPDATE SET
            room_version = COALESCE(excluded.room_version, rooms.room_version),
            predecessor_room_id = COALESCE(excluded.predecessor_room_id, rooms.predecessor_room_id),
@@ -1248,23 +1831,27 @@ fn apply_sync_room(
            encrypted = MAX(rooms.encrypted, excluded.encrypted),
            needs_operator_action = MAX(rooms.needs_operator_action, excluded.needs_operator_action),
            action_note = COALESCE(excluded.action_note, rooms.action_note),
+           own_membership = COALESCE(excluded.own_membership, rooms.own_membership),
+           metadata_error = CASE WHEN COALESCE(excluded.room_version, rooms.room_version) IS NOT NULL
+                                 THEN NULL ELSE rooms.metadata_error END,
            updated_at = excluded.updated_at",
         params![
-            room.room_id,
+            room_id,
             room_version,
             predecessor_room_id,
             successor_room_id,
             encrypted,
             needs_operator_action,
             action_note,
+            observed_membership,
             received_at
         ],
     )?;
     outcome.rooms += 1;
 
-    for value in room.state.iter().chain(room.timeline.iter()) {
+    for value in state.iter().chain(timeline.iter()) {
         let event = normalize_event(
-            &room.room_id,
+            room_id,
             value,
             room_version.as_deref(),
             Source::Sync,
@@ -1275,6 +1862,25 @@ fn apply_sync_room(
             outcome.events_duplicate += 1;
         }
     }
+    Ok(())
+}
+
+fn apply_sync_room(
+    conn: &Connection,
+    room: &event::SyncRoomUpdate,
+    previous_since: Option<&str>,
+    received_at: i64,
+    outcome: &mut SyncApplyOutcome,
+) -> Result<(), StoreError> {
+    apply_room_values(
+        conn,
+        &room.room_id,
+        &room.timeline,
+        &room.state,
+        room.own_membership.as_deref(),
+        received_at,
+        outcome,
+    )?;
 
     if room.limited {
         match previous_since {
@@ -1943,8 +2549,14 @@ fn close_gap(
     reason: &str,
     at: i64,
 ) -> Result<(), StoreError> {
+    // A repaired job is finished and its cursor is dropped. An unresolved job
+    // is terminal work that keeps its saved cursor and lower boundary so an
+    // explicit `run --retry-stalled` can resume it exactly where it stopped;
+    // it is never scheduled again while unresolved.
     conn.execute(
-        "UPDATE gap_jobs SET status = ?2, cursor_token = NULL, closed_at = ?3, close_reason = ?4
+        "UPDATE gap_jobs SET status = ?2,
+                cursor_token = CASE WHEN ?2 = 'repaired' THEN NULL ELSE cursor_token END,
+                closed_at = ?3, close_reason = ?4
          WHERE gap_id = ?1 AND status = 'open'",
         params![gap_id, status, at, reason],
     )?;

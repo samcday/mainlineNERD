@@ -57,6 +57,10 @@ pub struct SyncRoomUpdate {
     /// True when the server omitted events between `prev_batch` and the
     /// previously known position.
     pub limited: bool,
+    /// Our own membership state observed in this update, if any. This is a
+    /// control signal, not a participant roster: `leave`/`ban` disables work
+    /// for the room, and it is never used to archive other members.
+    pub own_membership: Option<String>,
 }
 
 /// One `/messages` page.
@@ -90,6 +94,7 @@ pub enum EventError {
 pub const MESSAGE: &str = "m.room.message";
 pub const ENCRYPTED: &str = "m.room.encrypted";
 pub const REDACTION: &str = "m.room.redaction";
+pub const ROOM_MEMBER: &str = "m.room.member";
 pub const ROOM_CREATE: &str = "m.room.create";
 pub const ROOM_ENCRYPTION: &str = "m.room.encryption";
 pub const ROOM_TOMBSTONE: &str = "m.room.tombstone";
