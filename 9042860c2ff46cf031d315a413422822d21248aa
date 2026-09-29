@@ -1,0 +1,1396 @@
+# Review: samcday/mainlineNERD#1 (`sprint/ingest-mvp` @ 9042860)
+
+> **Verification status (updated after the reproduction pass).** The first pass verified every finding by
+> independent code reading only (the reproducer agents' shells were broken by a full /tmp quota). A second pass
+> then re-ran reproduction for the 19 highest-value findings, each in an isolated worktree at PR head 9042860 with
+> the real crate, the real `MatrixTransport` against the loopback mock homeserver where applicable, and paused-time
+> runtime tests where applicable. **All 19 reproduced as failing tests** (in addition to F31 from the first pass):
+> F15, G2, F47, F50, F43, F51, F74, G1, G3, F9, F17, F16, F1, F3, F10, F48, F41, F65, F63.
+> Severity revisions from the reproducers: F9: medium → low (reproducer's call); F1: low → medium (reproducer's call); F3: low → medium (reproducer's call).
+> Per-finding test code, commands and output are in the "Reproduction pass" addendum at the end of this document.
+> The repro tests are consolidated on branch `review/pr1-repro-tests` (see the addendum).
+
+**How this was checked.** Every finding below got 1–3 independent verifier votes. The verifiers' shells broke for most of the run, so nearly all of this comes from reading source, not running it:
+- **Reproduced by a failing test (first pass):** only F31. **Second pass:** 19 more, see the preface above and the addendum.
+- **Checked by the finders against the built binary, Python sqlite or a serde_json scratch crate, then traced by verifiers:** F22, F23, F55, F56, F62, F63.
+- **Synapse behaviour:** marked *inferred* unless it was checked against Synapse source.
+
+## 1. Verdict
+
+**Correctness.** The happy path is correct. The edges an archiver actually depends on are not:
+- **F15 (the one high).** A room that leaves sync scope for a run comes back with a permanent hole that nothing records, and `status` says the room is complete. Ordinary events cause this: a failed alias lookup at startup, or a config edit.
+- **Eleven mediums.** Two examples:
+  - **G2:** a federation hiccup marks base backfill permanently complete.
+  - **F31:** a reverse-proxy 404 permanently stalls a room. Reproduced.
+
+**Size.** The size is not justified. Three independent panels put the essential core at **~1.8–3.5k source lines**, against 6.96k shipped plus 10.2k lines of tests.
+- About 330 source lines and ~820 test lines are a driver the binary never runs (F18).
+- The architecture doc describes that dead driver as the product's behaviour.
+
+**Recommendation: rewrite-smaller.** Do it as a guided subtraction that reuses about 1.5k lines of this PR:
+- event normalization;
+- the events/redactions/current_messages schema and its projection code;
+- ruma-based redaction pruning;
+- the adapter's request construction;
+- the `select!` skeleton.
+
+Don't make 20k lines that nobody has read the baseline of `main`.
+
+## 2. Confirmed findings
+
+### High
+
+**F15 (high): `src/store.rs:1888-1895`, `src/runtime.rs:277,293`. A room that drops out of sync scope for a run gets a permanent hole that nothing records.**
+
+*Mechanism.*
+- There is exactly one sync position: the global `sync_progress.since_token` (store.rs:112-118).
+- Every gap's lower bound is the previous global `since`: `VALUES (?1, ?2, 'limited_sync', ?3 /*previous_since*/ ...)`.
+- `apply_sync_batch` advances that token on every batch, whichever rooms were in the filter (store.rs:744-762).
+
+*Two ordinary triggers take an established room out of scope:*
+- **(a) Alias lookup fails at startup.** `/directory/room` fails 3 times (404/429/5xx, or federation is down). runtime.rs:277 then runs `report.unready.push(...); break;` without consulting the existing pin (F50).
+- **(b) The operator removes the room from config and later adds it back.**
+
+*What happens next.*
+- `set_configured_rooms` clears `configured` (runtime.rs:293).
+- The room is dropped from the filter (matrix.rs:290) and locally (matrix.rs:333), while `since` keeps advancing.
+
+*What happens when the room is re-admitted.*
+- `seed_room_history` only touches rows that never started (store.rs:1948-1952).
+- If the first sync is not limited, it takes the `else` branch at store.rs:1921-1922, which creates no gap.
+- If it is limited, the gap it creates is bounded at the new `since`.
+- Base backfill walks back from its older cursor and never reaches the hole.
+- Result: `history_complete`, 0 gaps, and days of missing messages.
+
+*Verifier notes.*
+- Correction: the join and metadata triggers the finder listed don't apply to established rooms (runtime.rs:309, 352).
+- adapter_tests.rs:1305 covers only a room that never started.
+- 3/3 votes real, all by reasoning. That incremental sync doesn't resend events when the filter widens is *inferred*. The local `is_allowed` drop causes the hole either way.
+
+*Fix.* Persist a per-room live token in the same transaction as the sync batch. When a room comes back with a stale token, open a gap down to that token, or at least record an unresolved gap. Fall back to the pin when alias lookup fails. Never un-configure a room on a transient failure.
+
+### Medium
+
+**G2 (medium): `src/store.rs:864-870`. The first `/messages` page with no `end` marks base backfill permanently complete.**
+- The page sets `token = NULL, complete = 1`. Nothing checks that m.room.create was reached.
+- Completed bases are never reopened: engine.rs:306, store.rs:996 and store.rs:1262-1265. `--retry-stalled` only touches stalled rows.
+- Synapse behaviour, verified in develop's `pagination.py`/`federation.py` via WebFetch:
+  - it returns `end_token=None` when `not limited and not events`;
+  - that happens after a foreground `maybe_backfill` that swallows every federation error (NotRetryingDestination, RequestSendFailed, 5xx, Exception).
+- Failure scenario: the bot joins a large federated room. Base backfill reaches the local frontier during a remote outage, so that room's history stops at the join forever while `status` says complete.
+- Votes: 2/2, by reasoning plus the upstream source.
+- Fix: add an `exhausted` state with a timestamp that keeps the last token, is re-probed later and can be reopened by `--retry-stalled`. Treat only reaching m.room.create, or a visibility cutoff, as terminal. Don't require m.room.create unconditionally: `joined`/`invited` visibility legitimately hides it.
+
+**F31 (medium): `src/matrix.rs:650-658`. `/messages` errors are classified by HTTP status alone. REPRODUCED.**
+- 400, 403, 404 and 422 all become `RoomUnavailable`. `record_history_error` turns that into a terminal stall (engine.rs:398-409).
+- ruma turns non-JSON bodies into a client-API error that keeps the real status (ruma-common error.rs:119-128), so proxy and WAF pages take the same path.
+- The verifier's failing test ran the real MatrixTransport against the axum mock:
+```
+t404: Err(RoomUnavailable("404"))   # text/plain "404 page not found" (Traefik-style)
+t403: Err(RoomUnavailable("403"))   # HTML Cloudflare challenge
+t400: Err(RoomUnavailable("400"))
+t422: Err(RoomUnavailable("422"))
+tunk: Err(RoomUnavailable("403"))   # JSON M_UNKNOWN
+stalled=1 next_request_after_blip=None
+panicked: a reverse-proxy 404 must not durably stall the room  left: 1 right: 0
+```
+- Failure scenarios:
+  - one reverse-proxy blip durably stalls the room until someone runs `--retry-stalled`;
+  - a WAF rule that 403s only `/messages` stalls every room at about one per second, while `/sync` keeps the process looking healthy.
+- The docs mention only 403 and not-found (operations.md:113). 400/422 aren't documented anywhere.
+- Fix: treat an error as room-local only when it has a standard Matrix JSON body with M_FORBIDDEN, M_NOT_FOUND or M_INVALID_PARAM. Treat NotJson bodies and unknown errcodes as Transient. Add adapter tests with non-JSON 4xx responses.
+- Siblings: F33 and F35.
+
+**F47 + F50 (medium): `src/runtime.rs:239-243`, `:258-296`. Alias handling is broken in both directions.**
+- **F47: alias drift aborts startup for every room.** A pinned alias that now resolves to a different room returns `Err(RuntimeError::Store(AliasDrift))` from inside the per-room loop (runtime.rs:239-243).
+  - This contradicts architecture.md:152-154: "startup is isolated per room".
+  - Routine room upgrades move aliases to the successor room. *Inferred:* the spec says SHOULD and Synapse does it.
+  - adapter_tests.rs:295-301 asserts the whole-run failure, and no unpin command exists.
+  - Workaround: change the config entry to `id = "!..."`.
+- **F50: a transient alias failure ignores the known pin.** `alias_pin` is only called from `pin_alias` (store.rs:512/526), so the room gets un-configured, which feeds F15.
+  - `set_configured_rooms(&ids)` runs before the `EmptyRooms` check (runtime.rs:293-296). With an all-alias config during an outage, it clears every configured flag and then errors.
+  - Correction: `status` still lists those rooms, because store.rs:1340 has no configured filter. It shows them as `configured=false`.
+- operations.md:26 says aliases are "resolved once". They are resolved on every start.
+- Fix:
+  - make drift a room-local "unready" with a reason;
+  - fall back to the pin when resolution fails;
+  - check for an empty room list before writing anything;
+  - make `set_configured_rooms` a single transaction (see also F7);
+  - add a repin command.
+
+**F43 (medium) + F49, F54, F52 (low): `src/runtime.rs:411-416`. Whether a room is ready is decided once, at startup.**
+- **F43: a room that isn't ready at startup stays out for the whole daemon lifetime.**
+  - `allow_room` is only called in `initialize` (runtime.rs:414). The allowlist can only grow (matrix.rs:94-107), and sync drops rooms that aren't on it (matrix.rs:333). So nothing during a run can make a room ready.
+  - Three transient failures in the roughly 3-second startup window (a 5xx, a slow federated join timing out) exclude the room until a restart.
+  - The test fake hides this. `ControllableTransport` inherits `is_allowed_room() -> true` (engine.rs:71-73), so runtime_tests.rs:465 ("ROOM2 becomes ready only from the sync batch that arrives mid-run") tests something production cannot do.
+  - A restart recovers the room.
+- **F49 (low): zero ready rooms still counts as a successful start.** If every room fails join or metadata, `initialize` returns Ok with no ready rooms. The daemon then long-polls an empty filter forever and looks healthy.
+- **F54 (low): the startup summary counts left, banned, encrypted and upgraded rooms as "ready".** This is cosmetic: `status` flags those rooms, and keeping them allowlisted is needed to observe a membership recovery.
+- **F52 (low): a failed join stays recorded after the operator reverts it.** A failed `join = true` writes `metadata_error`. Changing back to `join = false` never clears it (runtime.rs:343/352), because rooms that aren't ready get no sync data. The room stays unready until a join succeeds or someone edits SQLite.
+- Fix: re-run the readiness checks for configured rooms that aren't ready, inside `run()` with backoff. Fail startup when zero rooms are ready. Make the test fake honour an allowlist.
+
+**F51 (medium): `src/runtime.rs:309,411`. "Ready" doesn't mean "followable".**
+- `join = false` is the example config's default (config.example.toml:36). With a world-readable room the bot isn't in, the create-state fetch succeeds and the room is admitted and seeded.
+- `/sync` only iterates joined and left rooms (matrix.rs:332-343). The room gets one backfill, `complete=1` (store.rs:864-870), and then nothing, ever.
+- `status` shows `history=complete` with no membership flag (store.rs:1516).
+- Joining later still leaves the window between the seed and the join missing.
+- *Inferred:* Synapse lets non-members read state and `/messages` in world-readable rooms, but only if the homeserver is already in the room.
+- Fix: require an observed or successful join, or flag the room as "readable, not joined: no live sync".
+
+**F74 (medium): `src/runtime.rs:352`. Encryption and tombstone flags are only learned from `/sync` state (store.rs:1796-1805).**
+- `initialize` fetches only m.room.create (matrix.rs:263-268), and `apply_history_page` never updates room policy.
+- Failure scenario: the bot is already in a room that gets added to config after the archive has a `since` token.
+  - The room only receives incremental syncs, which don't resend an m.room.encryption event from years ago (*inferred* from the spec's delta semantics).
+  - The room is never flagged. Base backfill walks its whole `m.room.encrypted` history at one request per second, taking round-robin turns from other rooms.
+  - This contradicts "encrypted rooms are flagged and skipped" (architecture.md:147-148, 366).
+- The privacy impact is marginal: live sync already archives encrypted envelopes.
+- Fix: in `initialize`, also GET m.room.encryption and m.room.tombstone (404 means absent), or send `full_state=true` on the first sync after the set of admitted rooms changes.
+
+**G1 (medium) + F36 (low): `src/matrix.rs:268,538,550-557`. The create-state request format breaks on common servers.**
+- **G1: total outage on Synapse older than 1.135.** `room_create_metadata` always sends `?format=event`.
+  - Synapse before 1.135 returns an event dict with no `event_id` for room versions 3 and later. Verified: v1.134.0 `room.py` uses `format_event_for_client_v2(data.get_dict())`, and PR #18675 fixed it in 1.135.0.
+  - `looks_like_event` is true because of the `type` key, and the code then fails with "m.room.create metadata has no event id".
+  - The room is unready on every start. If all rooms are, you get F49: the daemon runs but archives nothing.
+- **F36 (low): the mirror case.** A content-only response that contains the room-type key `type` (for example `m.space`) is mistaken for an event envelope and refused, on servers that ignore `format`.
+- Fix for both: request the default content format. Only `room_version` is needed.
+
+**G3 (medium): `src/store.rs:1665,1826,987`. A tombstone freezes the predecessor room's backfill for good.**
+- `successor_room_id` never clears once set (COALESCE, store.rs:1826).
+- `upgraded` disables history (store.rs:1665), and `--retry-stalled` excludes the room (store.rs:987).
+- The limited-sync gap created by the batch that carried the tombstone can never run (store.rs:1889-1896).
+- Correction: this behaviour is documented (operations.md:115-116) but never justified. The predecessor's history is static and still readable.
+- Combined with "no stitching" (architecture.md:367-368), no configuration archives an upgraded room's pre-upgrade history. Configuring the old room id directly disables it before the first page.
+- Fix: treat the successor as metadata, and keep serving base and gap work for tombstoned rooms.
+
+**F9 (medium): `src/event.rs:198-201`. Reply fallbacks keep redacted text alive.**
+- `body_text` is copied verbatim, and the raw JSON keeps `formatted_body` with its `<mx-reply>` block.
+- Redacting the quoted parent prunes only the target and rows with `edit_target = ?` (store.rs:2240-2241).
+- Failure scenario: Alice redacts "my token is hunter2". Bob's fallback reply still carries it in `current_messages.body`, `events.raw_json` and both exports.
+- Votes: medium, low, medium.
+  - The low vote: Bob's event is not redacted on the server, and reply fallbacks were deprecated in spec v1.13.
+  - That still matters here, because backfilled older history is exactly where fallbacks live.
+- It also duplicates quoted text throughout the LLM corpus.
+- ruma already ships the fix, unused: `ruma_events::room::message::sanitize::remove_plain_reply_fallback`.
+- Fix: strip fallbacks when `m.in_reply_to` is present, at minimum in `body_text`. Narrow the claim at architecture.md:349.
+
+**F18 (medium): `src/engine.rs:414-688`. The sequential driver is dead code in the binary.**
+- None of these has a production caller:
+  - `run_history_once`, `run_room_history_once`, `run_gap_repair_once`, `poll_sync_once`;
+  - their outcome types, `PendingHistory` and `EngineError::HistoryAborted`;
+  - `max_pages_per_room` (set at main.rs:187, read only at engine.rs:586 and 657).
+- main.rs:199 calls only `runtime::run`, which uses only the request/apply primitives. 20 of the 21 engine_tests drive the dead loop.
+- architecture.md:249-258 specifies the dead driver: "returned error carries the pages already committed", an "explicit `rate_limited` flag", "no later room or gap is requested". The shipped runtime behaves differently:
+  - on a 401 it returns a bare error (runtime.rs:913-916), and main discards it together with the summary (main.rs:199-201);
+  - after a 429 cooldown it moves on to other rooms (runtime_tests.rs:1329).
+- The runtime's malformed-page stall branch (runtime.rs:947-962) has no test.
+- Verifier corrections:
+  - `open_gap_positions_for_room_{page,newest}` are live (runtime.rs:817, 871).
+  - The engine tests still exercise shared primitives (the cycle ledger, gap attribution).
+  - runtime_tests do cover 429/401/403 classification, so the claim that "the suite stays green on a runtime regression" is mostly refuted.
+  - What's left is misdirected tests and a spec that doesn't describe the binary.
+- Commit 9e9fedf spent a review cycle "fixing" this dead path (maintainer panel).
+- Fix: delete the driver, port the malformed-page and partial-progress scenarios to runtime tests, and rewrite that doc section.
+
+### Low
+
+Grouped by root cause. All are confirmed, and all were established by reasoning unless the entry says otherwise.
+
+**Sync-path poisoning and silent drops**
+- **F1: `src/runtime.rs:612`, `src/store.rs:751`. One bad event wedges sync for every room.**
+  - One event that can't be normalized (for example, no string `event_id`) rolls back the whole `/sync` batch. `run()` exits via `?`, `since` never advances, and the daemon crash-loops.
+  - History has room-local isolation (runtime.rs:947); sync has none. The store error isn't even recorded in `sync_progress.last_error` (engine.rs:276-291).
+  - Correction: the redaction-room-version trigger can't be reached for admitted rooms (matrix.rs:604-608). The real triggers need a non-conformant server.
+  - The rollback is documented (architecture.md:193). The resulting wedge isn't.
+  - Fix: quarantine per event or per room, and add an operator skip.
+- **F65: `src/store.rs:1778-1779,1824`. A later sync m.room.create can replace the validated room version.**
+  - Any string wins, via COALESCE with the new value first, and `metadata_error` is cleared (store.rs:1831).
+  - The next redaction in that room then fails with `UnknownRedactionRoomVersion`, which is the F1 wedge.
+  - Only a homeserver can trigger this.
+  - Fix: validate the version, and never replace a stored one.
+- **F63: `src/matrix.rs:471-473`. Some events are silently dropped.**
+  - The code does `serde_json::to_value(raw).unwrap_or(Value::Null)`.
+  - Events nested more than about 127 levels deep, or containing lone surrogates, pass ruma's `RawValue` capture but fail the re-parse. They're dropped from sync and history, and the batch still commits.
+  - The finder reproduced it on serde_json 1.0.151 with a 349-byte message nested 130 levels.
+  - This lets a sender keep their own messages out of the archive. The surrogate vector is probably blocked by servers (*inferred*).
+  - Fix: never map a failure to Null. Count or quarantine the event, and keep the envelope with `content: Box<RawValue>`.
+
+**Redaction and edit projection**
+- **F3: `src/store.rs:2034-2037,2240-2241`. Invalid edits escape redaction.**
+  - Redaction suppression is keyed on `edit_target`, which is set only for structurally valid edits.
+  - An invalid m.replace (for example, no msgtype) keeps its `* fallback` body and raw `m.new_content` after the original is redacted, in either arrival order.
+  - Fix: key suppression on `relation_type='m.replace' AND relates_to_event_id`.
+- **F10: `src/store.rs:2275-2278`. Invalid edits can become standalone messages.**
+  - `project_event` doesn't load `edit_attempt`. When a redaction targets an invalid edit, or a valid edit targets one, the invalid edit is projected as its own `current_messages` row.
+  - That violates "invalid edits … never become messages" (architecture.md:266).
+  - Two more cases:
+    - bundle promotion (the finder's case c);
+    - a server-redacted edit arriving on its own (case d). Stable room versions strip `m.relates_to` on redaction, so this one is unavoidable and should be documented.
+  - Fix: return early when `edit_attempt` is set or `relation_type` is `m.replace`.
+- **F13: `src/event.rs:352`. Bundled-replacement ingestion is redundant complexity.**
+  - Roughly 150 lines plus five provenance-dependent CASE branches (store.rs:2082-2094). It only adds anything inside unresolved gaps.
+  - Correction: removing bundles would not remove F10's phantom rows, because the root cause is that redaction strips `m.relates_to`.
+- **F14: `src/store.rs:2272`. Edits of originals outside accessible history never reach `current_messages`.**
+  - Caveat for any fix: orphan edits can't be checked against the original's sender. Flag them; don't project them as plain messages.
+- **F12: `src/store.rs:2297`. `redaction_ts` mixes server time and local ingest time.**
+  - It corrects itself when the real redaction arrives (COALESCE, store.rs:2413). The local time persists only if that redaction is never ingested.
+  - Fix: use `unsigned.redacted_because.origin_server_ts`.
+- **F11: `src/event.rs:234-244`. Thread fallbacks overwrite reply targets.**
+  - `is_falling_back` is ignored, so a thread-fallback `m.in_reply_to` overwrites `relates_to_event_id`. A genuine in-thread reply can't be told apart from a fallback.
+  - The raw JSON keeps the flag, so the information isn't lost.
+- **F21: `src/store.rs:1394`. The messages export has no msgtype.**
+  - Neither `current_messages` nor the export records msgtype, so m.notice (CI bots), m.emote and filename-only media bodies look like chat.
+  - It can be recovered by joining against the events export.
+- **F29: `src/event.rs:475`. The prune can fail open on a non-object `content`.**
+  - ruma 0.20's `redact` keeps a non-object `content` verbatim, despite its own docs (redaction.rs:31 vs 159-167).
+  - Needs a non-conformant server.
+  - Fix: return `None` when `content` isn't an object.
+- **F30: `src/event.rs:468`. `unsigned` can wreck the prune.**
+  - `canonical_object` runs over the whole event including `unsigned`. Any float or huge integer there sends the event to the strict envelope with `content: {}`, losing fields the room version keeps (for example v11 `redacts`).
+  - Fix: strip `unsigned` first.
+- **F62: `src/store.rs:373`. Redacted bodies survive on disk.**
+  - `secure_delete` is off, so redacted bodies stay in freed pages and WAL frames. The finder reproduced this on SQLite 3.53.3: `grep -a SEKRIT t.db` still hit after the UPDATE and `checkpoint(TRUNCATE)`.
+  - Correction: architecture.md:349 promises clean rows and exports, not erasure from the file, and a clean close deletes the WAL.
+  - Fix: set `PRAGMA secure_delete=ON` and `journal_size_limit`, and add a doc line saying the raw archive file isn't safe to share after redactions.
+- **F64: `src/store.rs:1397`. Removed rooms still show up.**
+  - Rooms removed from config still appear in `status`, which contradicts architecture.md:118-120.
+  - Exports keep them too, which does match the doc's "historical rows remain".
+  - There's no purge command.
+
+**Error classification, backoff and rate limits.** Root cause: classification by status code alone, plus one backoff shared by both planes.
+- **F33: `src/matrix.rs:652,663`. Too many statuses are fatal.**
+  - Any unlisted status (408, 409, 410, 413, 414) on either plane is fatal, as are 403/404 on `/sync`.
+  - A fatal history error returns before anything is stored and doesn't name the room (runtime.rs:912-916). So a deterministic odd 4xx crash-loops within one rotation after each restart.
+  - Correction: 3xx lands on Transient (a deserialization failure), not Fatal.
+- **F35: `src/matrix.rs:643,720`. Deserialization failures are retried forever.**
+  - A 200 with an HTML body from a misrouted proxy, or a schema mismatch, is classed Transient and retried forever. The SDK classes these as Permanent (error.rs:147-150).
+  - On history they should stall the room, like a MalformedEvent does (runtime.rs:947).
+- **F17: `src/runtime.rs:547-548,673-690`. Sync and history share one backoff deadline and one attempt counter.**
+  - History deferrals delay the next `/sync`, which contradicts architecture.md:106-107 and 244.
+  - A success on either plane resets the other plane's escalation. So:
+    - a `/sync` that returns 502 while `/messages` works is retried about once a second indefinitely;
+    - a poisoned `/messages` item never stalls.
+  - The only transient test can't fail: it asserts at least 500 ms against 1000 ms of pacing (runtime_tests.rs:335-341).
+  - Correction: the finder's "~75 s per sync" scenario is overstated, because a sync success also resets the counter.
+- **F32: `src/matrix.rs:659`. Proxy 429s lose their Retry-After.**
+  - ruma only reads `Retry-After` inside an M_LIMIT_EXCEEDED JSON body (ruma-common error.rs:101-117). A proxy's 429 falls back to 30 s, which contradicts architecture.md:129-131.
+  - The test labels at adapter_tests.rs:516-536 are wrong: the "body hint" case has no body hint.
+- **F41: `src/matrix.rs:686`. Rate-limit hints can be shortened.**
+  - `delay.as_millis() as u64` wraps: `Retry-After: 18446744073709552` becomes 384 ms.
+  - A past HTTP-date becomes 0, with no floor, so `/sync` re-polls at round-trip speed.
+  - This is the only real "never shortened" violation, and it sits one layer below the checked-deadline code.
+- **F42: `src/runtime.rs:1010`. Rate-limit hints are uncapped and invisible.**
+  - One `M_LIMIT_EXCEEDED` hint can pause both planes for hours with no log line or status entry. History 429s aren't persisted (runtime.rs:917-922).
+  - `DeadlineUnrepresentable` is only reachable from test-injected `Duration::MAX`.
+  - Correction: proxy 429s get the 30 s fallback (F32), so a long pause needs a Matrix-aware sender.
+- **F46: `src/runtime.rs:1023-1035`. The jitter isn't really jitter.**
+  - It's a deterministic function of `attempt`, and it's added after clamping, so the real cap is 1.25× (about 75 s).
+- **F53: `src/runtime.rs:258-262`. Startup honours hints in full, silently.**
+  - Up to 3 waits per phase per room. Four alias rooms with a 7200 s hint means about 24 h before the first line of output.
+- **F34: `src/matrix.rs:167-172`. The "prime the versions cache" comment is false.**
+  - `fetch_server_versions` is uncached (matrix-sdk client/mod.rs:2162), so whoami fetches `/versions` again.
+  - Correction: when the cache expires mid-run, the SDK refreshes it in the background and returns the stale value, so the finder's "25 h later misclassified 429" scenario is refuted.
+  - What's left is misleading startup diagnostics: a `/versions` 404 reads as "room not found".
+- **F39: `src/matrix.rs:132`. The fixed 30 s timeout is too short for federated joins.**
+  - Across 3 attempts it fails any join that takes more than about 93 s, and F43 then keeps the room out. History recovers on its own.
+- **F37: `src/matrix.rs:290`. The whole allowlist is inlined into every `/sync` URL.**
+  - At roughly 140–185 rooms that exceeds nginx's 8 KiB request line. The resulting 414 is Fatal.
+  - Fix: drop `room.rooms` (the `is_allowed` check is the real boundary) or upload the filter.
+- **F38: `src/matrix.rs:294`. The sync timeline filter sets no `types`.**
+  - Reactions and membership churn set `limited` and spawn useless gap jobs.
+  - `/messages` only excludes m.room.member.
+
+**Gap, backfill and retry mechanics**
+- **F16: `src/matrix.rs:464-465`. Kicks and bans can leave unrecorded gaps.**
+  - `left_room` hard-codes `prev_batch: None, limited: false`. A kick or ban after more than 20 events leaves no gap record, not even an unresolved one, which contradicts architecture.md:214.
+  - Fix: pass the fields through. The policy gate already blocks repair until the bot rejoins.
+  - Votes: low, medium.
+- **F19: `src/store.rs:900-906`. The "token" branch for closing a gap never fires on Synapse.**
+  - It compares a `/messages` token (`t…`) with a sync token (`s…`).
+  - Gaps close through the empty-page `history_start` branch instead. The outcome is correct, but the label is wrong and it costs one extra request.
+  - A server that ignores `to` would re-walk history for every gap.
+  - Every fake keys on `from` only and ignores `to` (tests/common/mod.rs:308-320, 788-808). The fixtures echo the sync token back as `end`, so the tests model a server that doesn't exist.
+  - Fix:
+    - treat an empty, `end`-less page returned for a request that carried `to` as "boundary reached";
+    - also close a gap when a page is entirely duplicates, which is the SDK's rule (pagination.rs:386-397).
+- **F20: `src/store.rs:993-1000`. `--retry-stalled` over-reports.**
+  - It re-enables token-cycle stalls and reports them as "resumed", though they deterministically stall again.
+  - Don't add a ledger clear: that would remove the cycle guard. Report them separately.
+- **G7: `src/main.rs:169`. `--retry-stalled` runs before the first `/sync`.**
+  - After an out-of-band rejoin it still sees the recorded leave or ban (store.rs:989). It resumes 0 items, and a second restart is needed.
+  - Skipping `join = true` after a recorded leave is documented intent (operations.md:30-31).
+- **F75: `src/runtime.rs:309`. Kicked rooms that never became ready are re-joined on every start.**
+  - A successful join records no membership, and rooms that aren't ready get no sync data. So a room the bot joined but never made ready gets re-joined on every start after a moderator kicks the bot.
+  - That matches the letter of operations.md:31 ("recorded leave"), not its spirit.
+  - The trigger that keeps a room unready permanently: an unsupported room version (matrix.rs:604-608).
+- **F24, F25, G9: `src/store.rs:1339,1532`, `src/runtime.rs:932`. Status and the run summary hide the reason things stopped.**
+  - F24: `status` never shows why a gap is unresolved, or whether retry can reopen it. Rows created without a `prev_batch` have a NULL cursor and can never be reopened. Correction: the gap boundary is always set.
+  - F25: text `status` shows `pending` for a room that has been failing with 502 for days, because `history_error` is only printed for stalled rooms. The half about policy-blocked rooms is refuted: they do carry flags.
+  - G9: `RunSummary` counts stalled and unresolved pages as successful `history_pages`, and never prints `rejected` (main.rs:202-214).
+
+**Storage, concurrency and lifecycle**
+- **F5: `src/store.rs:356-377,744-763`. Nothing enforces a single writer.**
+  - There is no writer lock, and the `/sync` commit doesn't compare-and-swap on `since`.
+  - Correction: the finder's silent-coverage-loss scenario is refuted. Coverage stays contiguous under interleaving. The real damage is duplicate requests, mislabelled gaps and per-process pacing.
+  - The real trigger: operations.md:58-64 calls `run --retry-stalled` "one-shot", but main.rs:169-199 then keeps running. Following the doc while the service is up gives you two writers.
+  - Fix: take a flock in `Store::open`, and either make `--retry-stalled` exit or fix the doc.
+- **F6: `src/store.rs:405`. Concurrent first opens fail.**
+  - `user_version` is read outside the IMMEDIATE transaction, so two processes opening a new archive at once fail with "table already exists". Loud and harmless.
+- **F7: `src/store.rs:637`. `set_configured_rooms` isn't atomic.**
+  - It's N+1 autocommits. A crash in the middle leaves the configured flags partial until the next start.
+- **F8: `src/store.rs:200`. The schema doesn't fit the queries.**
+  - `redactions_by_target` is a strict prefix of the primary key.
+  - `events_ordering` can't serve `ORDER BY COALESCE(ts,0)`.
+  - `(?1 IS NULL OR room_id=?1)` defeats the index, so `export --room` scans everything.
+  - `events` is WITHOUT ROWID with multi-KB `raw_json` rows.
+  - Correction: `gap_jobs_by_status` is used by `status`.
+  - No correctness impact. Fix it in the rewrite's v1 schema.
+- **G6: `src/store.rs:1400`. A slow export can bloat the WAL.**
+  - `export` holds one read snapshot for its whole run. Piped to a consumer that stalls while `run` backfills, it blocks checkpoints and the WAL grows. *Estimated*, not measured: up to about 1 GB/h at default settings. There's no `journal_size_limit`.
+  - Recommend writing to `--out` and piping that file, and set `journal_size_limit`.
+- **F22: `src/store.rs:379`. Read-only opens write side files.**
+  - `open_read_only` on a cleanly closed WAL archive creates `-wal` and `-shm` files, and fails on read-only media. The finder reproduced this on SQLite 3.53.3.
+  - The side files inherit the database file's mode, so nothing leaks.
+- **F57: `src/config.rs:469`. The storage checks are thin.**
+  - `ensure_private_dir` checks mode bits only, not the owner.
+  - The archive symlink check is separated from `Connection::open` by network I/O, and the `-wal`/`-shm` files aren't checked at all.
+  - `data_dir` is checked even when `database` is an absolute path somewhere else.
+  - This only matters when running as root against a directory some other user owns.
+  - Fix: add a uid check and open with `SQLITE_OPEN_NOFOLLOW`.
+- **F55: `src/config.rs:455`. With HOME unset or empty, the default `data_dir` silently becomes `<configdir>/~/.local/share/mainlinenerd`.**
+  - The finder reproduced this with `env -i` against the binary.
+  - Correction: `status` takes `--db`, so the finder's "status can't find it" part is wrong.
+  - Fix: reject a leading `~` when HOME isn't set, and print the resolved archive path at startup.
+- **F48: `src/main.rs:152`. The archive is bound to the config identity before `/whoami` verifies it.**
+  - The binding is written by the `ensure_binding` INSERT (store.rs:444-454); `/whoami` runs later (runtime.rs:173).
+  - A device_id typo on the first run leaves an empty archive that then refuses the corrected config, and both sides of the error look identical because they're redacted.
+  - Fix: bind after whoami succeeds.
+- **G4: `src/store.rs:456`. The binding scope is too wide, and there's no way to rebind.**
+  - The archive binding includes `device_id` and the literal homeserver URL. Neither scopes any stored cursor.
+  - Correction: logging in again with an explicit `device_id` recreates the device (ruma login.rs:44-46). `status` and `export` still work, because `require_binding` only checks that a binding exists.
+  - Fix: bind on `user_id`, and keep device and URL as informational fields.
+- **G5: `src/matrix.rs:158`. There's no documented way to get a long-lived token.**
+  - The session is restored with `refresh_token: None`.
+  - Tokens without a device are refused, which is documented intent (architecture.md:156-158).
+  - The docs never explain how to mint a durable token with a stable device_id. MAS-native tokens would expire within minutes (*inferred*).
+  - Fix: document `/login` with an explicit `device_id`, and state that MAS/OIDC-native tokens aren't supported.
+- **G8: `src/matrix.rs:630`. Every 401 looks the same.**
+  - They all collapse to "401 unauthorized"; `soft_logout` and M_USER_LOCKED are discarded.
+  - 401s at startup or on the history plane never reach `status` (runtime.rs:173 and 913-915; engine.rs:380-381).
+  - Every failure exits with status 1, so a systemd unit can't use `RestartPreventExitStatus`.
+  - Correction: UIAA gets its own message string.
+- **F27: `src/runtime.rs:189`. Device-id handling contradicts itself.**
+  - Mismatch errors redact the device id on both sides, so a whitespace typo can't be diagnosed.
+  - Meanwhile config accepts control characters in device ids, and `render_status` prints them raw (store.rs:1464-1471).
+  - Pick one policy.
+- **F61: `src/matrix.rs:124`. The HTTP client has no `.no_proxy()`.**
+  - With the loopback-only plain-HTTP homeserver, the bearer token goes in cleartext to `HTTP_PROXY`/`ALL_PROXY`. hyper-util's matcher.rs:122-133 has no loopback bypass.
+  - It fails loudly after the first request. One-line fix.
+- **F66: `src/store.rs:1516`. `status` prints some server-supplied strings raw.**
+  - Membership, and room versions from the sync path (unvalidated, see F65), go straight to the terminal. Escape-sequence injection is possible, but only from a compromised homeserver.
+  - The half about membership-enum eligibility is refuted.
+- **F40: `src/matrix.rs:381`. `/messages` chunk events aren't checked against the requested room.**
+  - Normalize takes the room id from context. Contrast create metadata (matrix.rs:562-575) and bundles (event.rs:370-373), which do check.
+  - This only protects against honest server bugs; a malicious server can forge anyway.
+
+**CLI and ops**
+- **F23: `src/main.rs:92-95`. `status` and `export` look in the wrong place.**
+  - They ignore `--config` and default to `./mainlinenerd.sqlite3`, a file nothing ever creates. `run` writes to `~/.local/share/mainlinenerd/archive.sqlite3`.
+  - `follow` and `run` silently drop `--db`/`MLN_DB`.
+  - The finder checked with the binary: `--config typo.toml status` never loaded the config.
+  - The split between the flags is documented (operations.md:73-74); the dead default isn't defensible.
+  - architecture.md:345 wrongly says exports live under `data_dir`.
+- **F26: `src/store.rs:1397`. Exporting by alias silently exports nothing.**
+  - `export --room #alias` matches nothing and exits 0. It leaves an empty 0600 file that `create_new` then refuses to overwrite on the corrected rerun.
+- **F28: `src/main.rs:112`. A failed export leaves a truncated file that blocks retries.**
+  - This happens on Ctrl-C or ENOSPC.
+  - On a non-I/O error, `BufWriter`'s Drop leaves a prefix ending on a complete line, which looks like a finished export.
+  - Fix: write to a temp file, then rename.
+- **F44: `src/main.rs:199`. The runtime is silent.**
+  - There's no logging crate, and the run summary is lost on an error exit.
+  - Correction: the error's cause is printed, and most history errors do reach `status`. History 429s and cooldown deadlines don't.
+- **F59: `src/main.rs:196`. Only SIGINT triggers a graceful stop.**
+  - SIGTERM kills the process without a summary. Data is safe, because every apply is a synchronous commit.
+  - Correction: systemd counts SIGTERM death as a clean stop.
+  - `cancellation_replays_committed_positions_exactly_once` can't fail: runtime_tests.rs:1348-1367 asserts on events that were never scripted in run 1.
+  - The binary's ctrl_c path is never tested; cli_live_tests stop the child with a 401 and SIGKILL.
+- **F56: `src/config.rs:154`. Every TOML or serde error becomes "invalid TOML at line N".**
+  - The finder checked with the binary: a missing `user_id` reports line 1.
+  - Key names aren't secrets, so pass them through.
+  - Correction: a parse failure creates no directories (main.rs:136-140).
+- **F58: `src/config.rs:264`. An absurd `sync_timeout_ms` passes validation.**
+  - A value above 2^53−1 passes, then every `/sync` fails Fatal while building the request (ruma opt_ms.rs:23-25), after startup has already joined rooms.
+  - Correction: the `history_interval_ms` half is refuted.
+- **F60: `src/runtime.rs:285`. Duplicate rooms slip past dedup.**
+  - A room listed once by id and once by alias survives the string-level dedup. That causes duplicate joins, inflated counts, and a room reported as both ready and unready.
+  - Correction: the metadata fetch is not duplicated.
+- **F45: `docs/operations.md:97`. The doc describes a scheduler that no longer exists.**
+  - It describes a "bounded ready set". The code uses `WorkQueue` (runtime.rs:733-737), and runtime_tests.rs:577 even refers to "an old ready-window design".
+  - Confirmed by reading. The guarantees still hold, through a different mechanism.
+- **G11: `.github/workflows/ci.yml:14,20,22`. CI doesn't test what was verified.**
+  - It runs floating `stable` with `clippy -D warnings`, never passes `--locked`, and never builds the declared MSRV 1.96 (Cargo.toml:5).
+  - Green CI is not the same as the verified `cargo test --locked --offline`.
+  - The finder cited lines 48/54/56; the real lines are 14/20/22.
+
+**Test-suite quality**
+- **F68: `tests/common/mod.rs:768`. The mocks ignore every request parameter.**
+  - They ignore `since`, `filter`, `to`/`dir`/`limit` and the Authorization header.
+  - `FakeTransport.sync_requests` is never read, and `ControllableTransport` doesn't expose sync requests at all.
+  - Consequence: a regression that sends `since: None` after reopening would pass all 187 tests. Every poll would then be an initial sync, skipping the gap path.
+  - adapter_tests.rs:137-139 says ROOM2 is "deliberately not in the local allowlist" and then calls `allow_room(ROOM2)`.
+  - Correction: history `to` is asserted at the engine and runtime level (engine_tests.rs:169-175; runtime_tests.rs:1550-1552).
+  - Votes: medium, low.
+- **F70: `tests/runtime_tests.rs:1331`. `late_429_after_room_deactivation_still_cools_other_rooms` passes even if the 429 is ignored.**
+  - The sync plane is neither held nor scripted, so it returns Transient at t=0. That delays the leave to about 1190 ms.
+  - Pacing alone then puts the next history request at 2190 ms or later, which clears the 2000 ms threshold whether or not the 429 was honoured.
+  - Votes: medium, low.
+- **F71: `tests/adapter_tests.rs:470`. `rooms.leave` and `limited: true` are never exercised through the real SDK boundary.**
+  - That's why F16 went unnoticed.
+- **F72: `tests/runtime_tests.rs:825`. `cooldown_is_never_shortened_by_the_other_plane` tests only the direction that can't regress.**
+  - Correction: `extend_backoff`'s max semantics are unit-tested (runtime.rs:1096-1116). What's untested is how the call sites use it.
+- **F73: `tests/runtime_tests.rs:83-84`. Waits in the tests have no timeout.**
+  - The `wait_for_*` helpers have no bound, and with paused time a regression advances virtual time forever.
+  - CI sets no `timeout-minutes`, so that becomes a 6-hour hang instead of a test failure.
+
+## 3. Contested findings
+
+- **F2: the schema is refuse-only, with no migration path (`src/store.rs:414-419`).** Votes: 1 real (low), 1 not real.
+  - For: the schema is already at v3 from its own churn before any release. Without migrations, the next version bump means a new database.
+  - Against: this is documented (architecture.md:177-187). The old archive is preserved and readable, and a future PR can add an N→N+1 step inside the existing IMMEDIATE transaction.
+  - The practical call is the same either way: reset to v1 before the first deployment.
+- **F4: redactions are applied with no sender or power-level check (`src/store.rs:2133-2149`).** Votes: 1 not real, 1 real (low).
+  - For:
+    - nothing compares the redacter with the target's sender;
+    - the adapter drops power_levels (matrix.rs:481-491), so a check isn't even possible;
+    - a pending redaction row pre-prunes targets fetched later;
+    - every test fixture is a same-sender redaction.
+  - Against: verified in Synapse develop (`events_worker.py`) that the server withholds unauthorised or domain-mismatched redactions ("Withholding redaction %s whose sender domain…"). The client already trusts its homeserver for everything else.
+  - Worth one line stating that trust assumption in the docs. Not worth a state resolver.
+- **F76: matrix-sdk is used as a three-call HTTP shim (`src/matrix.rs:130`).** Votes: 1 real (low), 1 not real.
+  - Both votes agree on the facts:
+    - the SDK surface used is tiny;
+    - SDK retries are turned off and then rebuilt by hand;
+    - typed events are flattened to `Value`;
+    - vodozemac and oauth2 are compiled in, non-optionally.
+  - They disagree on whether that's a defect or a legitimate trade-off.
+  - The SDK's `error!("{e:?}")` line could log URLs containing tokens, but only if a log subscriber is ever added.
+  - This is the architecture decision you need to make; see §4.
+
+## 4. Big picture: 20k lines vs off-the-shelf
+
+**What matrix-sdk 0.19.1 gives for free** (sdk-veteran panel, checked against the registry source):
+- **The sync loop.** `sync_with_result_callback` with an owned token. The stream doesn't send the next `/sync` until the callback returns, the token only advances on success, and there's a 1 s anti-spin floor (sync.rs:320-351).
+- **Passivity.** `set_presence(Offline)`. E2EE and sqlite are independent feature flags.
+- **Retry.** `RequestConfig` backoff with the same 500 ms / 60 s constants the PR re-typed (native.rs:57-58 vs runtime.rs:91-92), a 15-minute cap, and Retry-After support.
+- **Raw events.** `TimelineEvent`, which keeps the raw event and carries `limited`/`prev_batch` for both joined and left rooms.
+- **Typed parsing.**
+  - Typed relations, including `io.element.thread`, which event.rs:215-257 ignores. This is a panel observation, not a pipeline-verified finding.
+  - `redacts(&rules)`.
+- **Pagination.** `Paginator` end handling.
+
+**What genuinely needed custom code:**
+- An SQLite sink we own, with `since` committed in the same transaction as the events. The SDK persists its own token before handlers run (sync.rs:160-176), so it can't be the source of durability. The PR gets this right (store.rs:736-766).
+- Not using the event cache. It wipes rooms on channel lag and on ignore-list changes, so it isn't an archive.
+- `/messages` via `Client::send`. With a memory store there's no `Room` handle for idle rooms after a restart.
+- The gap table, the edit and redaction projection with pending redactions, and `status`/`export`.
+
+Credit where it's due: the PR made all four of those calls correctly. It also got ruma-based pruning, the strict redaction-target rule and presence Offline right.
+
+**Where the lines went.**
+- **It rebuilt what the SDK already had.** It used the heaviest dependency available (387 crates in Cargo.lock) as the thinnest slice possible (F76). Then it rebuilt by hand:
+  - the sync loop;
+  - backoff;
+  - error classification, twice (matrix.rs:622-665 vs 694-722);
+  - event parsing.
+
+  Several of the rebuilds are worse than the originals (F17, F16, F32, F41).
+- **Speculative insurance.** Each piece below comes with its own table and its own tier of tests:
+  - a durable `history_visited` cycle ledger;
+  - bundle recovery and promotion, with about 1,050 test lines (store_tests.rs:1793-2839);
+  - checked deadlines that only `Duration::MAX` can reach (F42);
+  - a stale-page compare-and-swap, unreachable in the single-process runtime but directly tested (the G10 claim was refuted);
+  - readiness gating and alias pins;
+  - a schema-refusal matrix for versions that never shipped;
+  - byte-exact device ids;
+  - two schedulers, one of them dead (F18).
+- **The readiness and alias machinery** is exactly where the confirmed mediums cluster: F15, F43, F47, F50, F51, F74, G1.
+
+**Essential size.** The panels estimate:
+- 1.8k source lines (sdk-veteran);
+- 2.0k (pragmatic-mvp);
+- 3.5k (maintainer-risk).
+
+That's against 6.96k source lines shipped, and about 1.5–2.5k lines of tests would be needed. The honest range is **~2–3.5k source lines**, depending on whether you adopt the SDK's sync loop.
+
+**Cut list** (the panels agree; line counts are approximate):
+
+| Cut | src | tests | Refs |
+|---|---|---|---|
+| Sequential engine driver, its outcome types, `max_pages_per_room` | ~330-360 | ~820 (engine_tests) + FakeTransport | F18 |
+| Bundled-replacement recovery and promotion | ~120-200 | ~1,050 | F13 |
+| Dead store queries (`bases_needing_history_*`, `open_gap_positions_{page,newest}`, `room_active`, `store_mut`) | ~150-180 | ~40 | F18 |
+| Checked-deadline machinery and `DeadlineUnrepresentable` | ~150 | ~250 | F42 |
+| `history_visited` ledger → an `end==from` check plus an in-memory set | ~80 | ~270 | F20 |
+| Separate base/gap state machines plus the fairness `WorkQueue` → one `backfill_jobs` table, round-robin | ~350-700 | ~330 | F19 |
+| Three copy-pasted startup retry loops → one helper, or fail fast | ~200-250 | — | F53 |
+| Create-metadata classifier and readiness column → a 20–30-line version fetch using ruma types | ~250-350 | ~150 | G1, F36, F43 |
+| `--retry-stalled` machinery | ~80 | ~370 | F20, G7 |
+| Schema v2/v3 refusal paths (reset to v1) | ~50 | ~160 | F2 |
+| Duplicate error classifier | ~30 | — | F33 |
+| architecture.md → 25 bullets or fewer, each naming its test | ~350 doc lines | — | F18, F45 |
+
+**What the tests actually tell you.** The maintainer panel sampled 40 of the 187 tests:
+- about 52% would catch a realistic regression in shipped code;
+- about 12% test dead code;
+- about 35% defend against inputs that can't occur, or duplicate other tests.
+
+Weighted by lines, about 4–4.5k of the 10.2k test lines carry weight. "187 green, clippy clean" tells you little here:
+- the fakes can't express real token semantics (F19, F68);
+- several assertions can't fail (F59, F70, F72);
+- the one test that proves in-run readiness proves something production can't do (F43);
+- nothing runs against a real homeserver.
+
+Worth keeping: the `ControllableTransport` plus paused-time harness, the loopback axum mock, and the two real-binary CLI tests.
+
+**Docs.** architecture.md reads like rationalisation assembled after the review rounds, not a spec. Of 16 claims spot-checked by the maintainer panel, 5 are false or stale:
+- startup isolation (F47);
+- transient failures deferring only one item (F17);
+- Retry-After honoured on any 429 (F32);
+- "the future adapter" (architecture.md:283, event.rs:3), although the adapter exists;
+- the ready set (F45).
+
+**Provenance risk** (maintainer panel):
+- All 7 commits are authored as you, with no AI attribution, so `git blame` pins all of this on you.
+- Commit 1ea5781 is an 11k-line drop with no commit message body.
+- There are no `refs/notes/evidence`.
+
+## 5. Recommended next steps
+
+1. **Don't merge the branch.** Leave PR #1 open as reference, or convert it to a draft.
+2. **Settle the protocol unknowns against a real Synapse first.** One afternoon with a docker Synapse smoke test covers:
+   - `/messages` `to`/`end` behaviour, and which gap-close branch actually fires (F19, G2);
+   - the `format=event` response shape (G1);
+   - whether non-members can read world-readable rooms (F51);
+   - whether widening the filter on an incremental sync resends anything (F15, F74);
+   - whether unauthorised redactions are withheld (F4).
+
+   Store the traces as `refs/notes/evidence` on 9042860.
+3. **Make the architecture call (F76).** Either use matrix-sdk properly (`sync_with_result_callback` with an owned token, SDK `RequestConfig` retries, ruma typed extraction), or drop it for ruma client-api plus reqwest. The current middle ground pays for both.
+4. **Rewrite-smaller on a fresh branch.**
+
+   Reuse from this PR:
+   - `event.rs` normalization, without bundles;
+   - the events/redactions/current_messages schema, with `store_event`, `project_event`, `mark_redacted` and `suppress_replacement_bodies`;
+   - `matrix.rs` request construction;
+   - the `runtime::run` `select!` skeleton.
+
+   Target 2.5k source lines or fewer and about 2k lines of tests.
+
+   Design these out rather than patching them:
+   - a per-room live position, and never un-configuring a room on a transient failure (F15, F50);
+   - alias drift as a room-local problem (F47);
+   - re-evaluating readiness during the run (F43, F49, F51, F74);
+   - error classification that looks at the errcode (F31, F33, F35);
+   - backoff per plane, with a stall after N consecutive failures (F17);
+   - no "complete" on an `end`-less page (G2);
+   - `left_room` passing `limited`/`prev_batch` through (F16);
+   - stripping reply fallbacks with ruma's `sanitize` (F9);
+   - binding the archive only after whoami succeeds (F48);
+   - requesting the default content format (G1, F36).
+5. **Cheap fixes if any of this code stays in use meanwhile:**
+   - `.no_proxy()` (F61);
+   - `--locked`, a pinned toolchain and `timeout-minutes` in CI (G11, F73);
+   - the `status`/`export` default path (F23);
+   - a single-writer flock (F5);
+   - `secure_delete` (F62).
+6. **Open a tracking issue** for the rewrite that lists this report's finding ids, and link it from PR #1.
+
+## 6. Refuted findings (for the record)
+
+- **F67, "the documented invocation leaks the token to shell history":** `MLN_ACCESS_TOKEN=...` in the docs is a placeholder. The code's no-secrets promise covers the program's own outputs, and those hold.
+- **F69, "tautological assertions in the bundle and idempotence tests":** the `$bad-noid` check is indeed vacuous. The regression it was meant to catch is still caught, by the `current_messages.body == "id original"` assertion (store_tests.rs:2059-2071).
+- **F77, "`status` counts are O(archive)":** covering indexes serve the events count, WAL readers don't block the writer, and nothing polls `status`. No defect at any plausible scale.
+- **G10, "the stale-page compare-and-swap and commit-time policy recheck are unreachable, and the tests imply a concurrency guarantee that doesn't exist":** `history_commit_rechecks_mutable_room_policy` and `ineligible_work_items_refuse_late_in_flight_pages` (store_tests.rs:3518, 3763) test those guards directly. The doc's claim is true of the store operation.
+- **G12, "no backup or restore story, so the docs mismatch":** the docs promise nothing about backup. Copying a live WAL database with `cp` is a generic SQLite operator error. A clean stop checkpoints and deletes the WAL.
+
+No findings were left unverified.
+
+---
+
+# Reproduction pass (19 findings, one isolated-worktree Opus 5.5 agent each)
+
+## F15 — REPRODUCED (agent severity: high, confidence 0.9)
+
+**Reasoning.** Reproduced end to end with the real code: runtime::initialize_with_policy, the real MatrixTransport (matrix-sdk Client::send) against the axum loopback mock homeserver, and the real Store. The test simulates three restarts on one archive.
+
+Run 1: config is alias #eng (resolving to ROOM) plus ROOM2. Both rooms are ready. A sync commits s1, and ROOM's base history is completed via apply_history_page.
+
+Run 2: the alias returns 404 on every attempt. initialize reports it unready and ignores the existing alias_pin. ROOM gets configured=0, and t2.is_allowed_room(ROOM) is false, so ROOM is out of the sync filter. Two batches for ROOM2 then advance the global token s1 -> s3.
+
+Run 3: the alias resolves again and ROOM is re-admitted. The incremental sync from s3 carries one non-limited ROOM event (prev_batch pA3), committing s4. The test then calls store.retry_stalled_configured, the explicit operator recovery control.
+
+It asserts the correct behaviour: ROOM has at least one open or unresolved gap, or does not report history_complete. The assertion fails. Status reports history_complete=true, open_gaps=0, unresolved_gaps=0, and gap_jobs has no rows for ROOM. retry_stalled finds nothing to recover (base 0, gaps 0) and ROOM has no open gap positions. The (s1, s3] interval is never fetched, and nothing records that it is missing.
+
+Verified by running: every statement above about store and runtime state.
+
+Inferred, not run: that a real Synapse given `since=s3` with the widened filter returns only events after s3 for the re-admitted room. The mock scripts that response. This is the standard incremental-sync semantic, and the finding's verifiers stated the same inference.
+
+Caveats:
+- The config-removal trigger (comment a room out, re-add it later) goes through the same code path (set_configured_rooms plus the global previous_since) but was not separately tested.
+- The limited re-admission variant (a gap bounded at the newer global token instead of s1) was not tested either. By code, apply_sync_room uses previous_since, so that gap would be bounded at s3 and would miss (s1, s3].
+- docs/architecture.md Known limits says only limited-sync gaps are modeled. That could be read as partial cover, but the spec also says an unresolvable interval "never claims coverage", and status here does claim complete with zero gaps. So the doc does not excuse it.
+
+My severity is high. This is silent, permanent data loss in an archival tool, and the trigger is mundane: a transient directory 404/429/5xx at startup, plus the pinned room id that could have been used is ignored. Status actively misreports completeness.
+
+**Evidence.**
+
+Test: tests/repro_F15.rs::f15_room_out_of_scope_for_a_run_leaves_a_recorded_gap, a new file using `mod common;` and the MockServer. It runs against PR head 9042860.
+
+Command: `cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-1 && CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F15 f15_room_out_of_scope_for_a_run_leaves_a_recorded_gap -- --nocapture > /dev/shm/repro/F15/test1.txt 2>&1` (exit code 101)
+
+Output (/dev/shm/repro/F15/test1.txt):
+```
+F15 DIAG: configured=true history_complete=true history_token_set=false open_gaps=0 unresolved_gaps=0 gap_jobs_rows=0 open_gap_positions=[] rooms_needing_history=1 retry_stalled=RetryStalledOutcome { base: 0, gaps: 0 } since=Some("s4")
+thread 'f15_room_out_of_scope_for_a_run_leaves_a_recorded_gap' panicked at tests/repro_F15.rs:250:5:
+ROOM was out of sync scope while the global token advanced s1 -> s3, yet status claims history_complete=true with open_gaps=0 unresolved_gaps=0 (gap_jobs rows for ROOM: 0); nothing will ever fetch the missed interval
+test result: FAILED. 0 passed; 1 failed
+```
+The rooms_needing_history=1 entry is ROOM2, whose base was never completed; it is not ROOM.
+
+Intermediate assertions that passed along the way:
+- Run 2 report.unready contains "#eng:hs.example.org".
+- !t2.is_allowed_room(ROOM) and !store.room_configured(ROOM).
+- since_token is s3 after run 2.
+- ROOM is re-admitted in run 3.
+
+Code path: runtime.rs:258-278 gives up on the alias without calling store.alias_pin. runtime.rs:292-293 then calls set_configured_rooms, which clears the room's configured flag. Separately, store.rs:744-762 uses a single global previous_since as the gap bound and advances it for every batch.
+
+Test files: /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-1/tests/repro_F15.rs, /dev/shm/repro/F15/repro_F15.rs
+
+## G2 — REPRODUCED (agent severity: medium, confidence 0.8)
+
+**Reasoning.** Verified empirically (store level, PR head 9042860): a configured room is seeded from sync with prev_batch p1. Base page p1->p2 carries two older messages. Then page p2 arrives with an empty chunk and no `end`, which is Synapse's shape when its local DB is exhausted and foreground federation backfill failed. m.room.create never appears in any history chunk. After that the base is Completed, token=NULL and complete=1. None of the three recovery paths reopens it: retry_stalled_configured (base: 0), a restart that reopens the store and calls seed_configured_room_history (false), and a later sync with a fresh prev_batch. rooms_needing_history no longer contains the room, and status() reports history_complete=true. The truncation is permanent and silent, and status claims completion.
+
+Inferred, not driven: that Synapse really does return an end-less empty page when federation backfill fails or is in backoff. The finder and verifiers read this from Synapse source. I did not run a real Synapse or cause a federation outage, and a test here cannot do that.
+
+Caveat that caps severity: this is the documented design. architecture.md:228-229 says "`end` absent means the start of accessible history". Lines 145/167 say completed work is never reopened. The existing test retry_stalled_only_re_enables_eligible_configured_rooms asserts "Completed E must never be reopened". matrix-sdk interprets end==None the same way. So the code matches its own spec, and the spec is too trusting of the server. For an archiver the consequence is real but conditional on federation health at one specific request.
+
+My severity: medium. The data loss is silent and permanent with no operator escape hatch, but it needs a transient federation failure at exactly the request that reaches the local frontier. A cheap mitigation is a distinct 'exhausted' state that --retry-stalled can reopen, or requiring m.room.create in the chunk before setting complete=1.
+
+**Evidence.**
+
+Test: g2_endless_page_without_room_create_is_not_permanently_complete in tests/repro_G2.rs (new file, uses `mod common;`)
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-2 && TMPDIR=/dev/shm/repro/G2/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_G2 g2_endless_page_without_room_create_is_not_permanently_complete -- --nocapture
+(TMPDIR override needed only because tempfile's default /tmp is over quota here: the first run failed with "disk I/O error" in open_store, see /dev/shm/repro/G2/test1.txt.)
+
+Output (/dev/shm/repro/G2/test2.txt):
+G2 OBSERVED: frontier_status=Some(Completed) complete_after_frontier=true token_after_frontier=None retry_stalled=RetryStalledOutcome { base: 0, gaps: 0 } reseeded=false scheduled_after_restart_and_sync=false complete_final=true status_report_history_complete=Some(true)
+thread 'g2_endless_page_without_room_create_is_not_permanently_complete' panicked at tests/repro_G2.rs:98:5:
+G2: base history truncated at the local frontier is never rescheduled (complete=true, retry_stalled=RetryStalledOutcome { base: 0, gaps: 0 }, reseeded=false)
+test result: FAILED. 0 passed; 1 failed
+
+Code responsible: src/store.rs apply_history_page, arm (AppliedWork::Base, None, _, _) -> "UPDATE room_history SET token = NULL, complete = 1, stalled = 0 ..." with no m.room.create/empty-chunk check. retry_stalled_configured requires "stalled = 1 AND complete = 0 AND token IS NOT NULL". seed_configured_room_history requires "token IS NULL AND pages = 0 AND complete = 0". rooms_needing_history requires "complete = 0".
+
+Test files: /dev/shm/repro/G2/repro_G2.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-2/tests/repro_G2.rs
+
+## F47 — REPRODUCED (agent severity: medium, confidence 0.95)
+
+**Reasoning.** Verified by running the test: the config has two rooms, alias #eng:hs.example.org (resolving to !room) and an unrelated room id !room2. It uses the real MatrixTransport against the loopback mock homeserver. The first initialize is Ok and both rooms are ready. The mock then points the alias at !room3, which stands in for an upgrade that moved the alias. The second initialize returns Err(Store(AliasDrift{..})) for the whole run. The test asserts that !room2 proceeds and that #eng is reported unready, which is the per-room isolation that docs/architecture.md:152-154 promises. That assertion fails. Also verified with grep: the only write to room_pins is the INSERT at store.rs:537 (ON CONFLICT DO NOTHING). There is no UPDATE or DELETE anywhere in src/, so nothing in the program can re-pin the alias and the failure repeats on every restart until someone edits SQLite by hand or rewrites the config entry as a room id. Refusing the drift is correct and intended, and the test also asserts that !room3 is not admitted. The defect is how far the failure spreads: one drifted alias stops ingestion for every room. Inferred, not verified: that real room upgrades move aliases so this triggers routinely. The CS spec's room-upgrade server behaviour says to move local aliases, and I did not check Synapse. Severity medium, because it is a total ingestion outage with a clear error message (no data loss or corruption) and it needs manual operator intervention. Note on the environment: tempfile defaults to /tmp, which is over quota and gave a SQLite disk I/O error, so the run used TMPDIR=/dev/shm/repro/F47/tmp. The test was put in a new file rather than adapter_tests.rs, because the shared target dir's fingerprint for adapter_tests tracked another worktree's source and did not rebuild (it ran 0 tests).
+
+**Evidence.**
+
+Test: repro_f47_alias_drift_is_isolated_to_that_room in tests/repro_f47.rs (new file, uses mod common).
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-3 && TMPDIR=/dev/shm/repro/F47/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_f47 repro_f47 -- --nocapture > /dev/shm/repro/F47/test3.txt 2>&1
+Output (/dev/shm/repro/F47/test3.txt):
+F47 first start report: InitializeReport { rooms: ["!room:hs.example.org", "!room2:hs.example.org"], joined: [], versions_learned: [...], unready: [] }
+thread 'repro_f47_alias_drift_is_isolated_to_that_room' panicked at tests/repro_f47.rs:89:23:
+F47: alias drift on #eng aborted startup for EVERY room (ROOM2 is unrelated and should have proceeded): Store(AliasDrift { alias: "#eng:hs.example.org", pinned: "!room:hs.example.org", resolved: "!room3:hs.example.org" })
+test result: FAILED. 0 passed; 1 failed
+Cause: src/runtime.rs:239-243 `if let Err(error) = store.pin_alias(...) { return Err(RuntimeError::Store(error)); }` returns before set_configured_rooms (293) and the join/metadata loop. Other alias failures go to report.unready (277, 284). The grep for room_pins shows only the INSERT at src/store.rs:537 and the SELECT at 516. There is no UPDATE or DELETE, so nothing can re-pin.
+
+Test files: /dev/shm/repro/F47/repro_f47.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-3/tests/repro_f47.rs
+
+## F50 — REPRODUCED (agent severity: medium, confidence 0.95)
+
+**Reasoning.** Verified by running it: both variants of the finding reproduce against PR head 9042860, using the real MatrixTransport and the axum loopback mock homeserver. I added a small hook to tests/common/mod.rs, `MockState.alias_failures`, so the mock can answer `/directory/room/{alias}` with a scripted response. The test uses a 502 M_UNKNOWN, which is how a homeserver answers when the alias's remote server can't be reached.
+
+(1) All rooms configured by alias. The first start pins both aliases and makes both rooms configured and ready. On the second start both aliases return 502. adapter_error maps that to Transient, so it retries up to max_attempts and then marks the alias unready. It never falls back to the pin, which is still in the store (the test prints `pins=(Some(!room),Some(!room2))`). `set_configured_rooms(&[])` then runs before the EmptyRooms check, so initialize returns `Err(EmptyRooms)` and both rooms end with configured=false. On status: the room rows are not deleted and still show in `render_status`, but they are all `configured=false`. So "no configured rooms" is accurate. The reporter's stronger claim that status goes blank, which a verifier already questioned, is wrong.
+
+(2) One of two aliases fails. initialize returns Ok with `rooms=[!room2]` and `unready=[(#a, "temporarily unavailable")]`, and ROOM is un-configured even though `pin(A)=Some(!room)`. This contradicts docs/operations.md:26, which says aliases are "resolved once and pinned to their canonical room id". The pin is only used to detect drift, never as a fallback.
+
+Inferred, not tested:
+- The next successful start re-configures the rooms, so the damage is limited to the outage.
+- During a long-running run/follow the dropped room is excluded from the sync filter and allow_room while the global since token advances. That is the scope-hole consequence the verifiers described. I did not drive a sync to show events actually being lost.
+- 404 M_NOT_FOUND takes the same path (RoomUnavailable leads to GiveUp, then unready), according to code reading.
+
+My severity: medium. No archived data is lost or corrupted. But one remote federation outage at startup either stops ingestion completely (all aliases) or silently drops pinned rooms for the whole run (some aliases).
+
+Test-env note: Store::open failed with a SQLite disk I/O error until TMPDIR was set to /dev/shm/repro/F50/tmp, because /tmp is over quota.
+
+**Evidence.**
+
+Tests: f50_all_alias_outage_keeps_pinned_rooms_configured and f50_partial_alias_outage_keeps_pinned_room_in_scope in tests/repro_F50.rs. Helper change: tests/common/mod.rs adds `alias_failures: Mutex<HashMap<String, MockResponse>>` to MockState, and mock_alias returns that response when one is set.
+
+Command:
+cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-4 && TMPDIR=/dev/shm/repro/F50/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F50 -- --nocapture --test-threads=1
+
+Output (/dev/shm/repro/F50/test2.txt):
+F50 all-alias restart result: Err(EmptyRooms)
+F50 after outage: configured(ROOM)=false configured(ROOM2)=false configured_room_ids=[] pins=(Some("!room:hs.example.org"),Some("!room2:hs.example.org"))
+room !room2:hs.example.org v11 configured=false events=0 ...
+room !room:hs.example.org v11 configured=false events=0 ...
+panicked at tests/repro_F50.rs:107:5: assertion `left == right` failed: a transient alias outage must not un-configure pinned rooms
+  left: []
+ right: ["!room:hs.example.org", "!room2:hs.example.org"]
+F50 partial restart report: InitializeReport { rooms: ["!room2:hs.example.org"], joined: [], versions_learned: [], unready: [("#a:remote.example.org", "temporarily unavailable")] }
+F50 partial: configured(ROOM)=false configured(ROOM2)=true pin(A)=Some("!room:hs.example.org")
+panicked at tests/repro_F50.rs:142:5: pinned room behind a transiently failing alias must stay configured
+test result: FAILED. 0 passed; 2 failed
+
+Code responsible:
+- src/runtime.rs:263-279: the GiveUp branch never calls store.alias_pin.
+- src/runtime.rs:292-296: `store.set_configured_rooms(&ids, now)?;` runs before `if resolved.is_empty() { return Err(RuntimeError::EmptyRooms); }`.
+
+Test files: /dev/shm/repro/F50/repro_F50.rs, /dev/shm/repro/F50/common_mod.diff, /dev/shm/repro/F50/common_mod.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-4/tests/repro_F50.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-4/tests/common/mod.rs
+
+## F43 — REPRODUCED (agent severity: medium, confidence 0.9)
+
+**Reasoning.** Reproduced at 9042860 with the real MatrixTransport against the axum loopback mock. I used a new file, tests/repro_F43.rs.
+
+Setup:
+- Two rooms, ROOM and ROOM2. StartupPolicy uses max_attempts=3, the same as the default, with delays shrunk to 1-2 ms.
+- ROOM's m.room.create fetch returns 502 exactly three times. Every create fetch after that returns a valid v11, so the homeserver has recovered by the time initialize() finishes.
+- Precondition checked: initialize() reports ROOM as unready and ROOM2 as ready.
+- runtime::run(RunSettings::run(1)) then runs for about 4 s against the healthy server.
+- A second live /sync batch is then pushed with messages in both ROOM and ROOM2. The mock ignores the sync filter, like the existing deferred-room adapter test.
+
+The test asserts the correct behaviour: a room that was unready only because of a transient blip is re-checked, admitted and archived during the run. It fails.
+
+Verified from the run output:
+- After init, the runtime never fetched ROOM's metadata again (0 create re-fetches).
+- is_allowed_room(ROOM) was still false at the end of the run.
+- ROOM's live event was not archived, while ROOM2's event from the same batch was. So the harness worked, and ROOM's event was dropped by the local allowlist in MatrixTransport::sync (matrix.rs:333).
+
+Inferred from code, not driven by the test:
+- The only allow_room caller is runtime.rs:414.
+- refresh_rooms only re-reads configured_room_ids and never re-checks readiness.
+- ControllableTransport inherits the default is_allowed_room()=true (engine.rs:193), which masks this in runtime_tests.
+- The alias variant is the same pattern (report.unready, then no set_configured_rooms entry), but I did not drive it.
+
+One mitigation the finding downplays: docs/architecture.md:95 openly says metadata failures recover "on a later start", and :152-154 promises only "bounded retries" at startup. So restart-only recovery is a documented design choice, not a broken promise. The misleading parts are:
+- the refresh_rooms doc comment, "picks up newly ready rooms".
+- the bounded status reason "temporarily unavailable", which implies a retry that never comes.
+
+The operational impact is real: a reverse-proxy 502 during a homeserver restart silently drops a curated room for the daemon's lifetime, and there is no in-run recovery path. My severity is medium: data is not corrupted, but it can be lost to retention, and the only hint is one startup line on stderr.
+
+**Evidence.**
+
+Test: f43_transiently_unready_room_recovers_during_the_run in tests/repro_F43.rs (copy at /dev/shm/repro/F43/repro_F43.rs).
+
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-5 && CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F43 f43_ -- --nocapture > /dev/shm/repro/F43/test1.txt 2>&1
+
+Output (/dev/shm/repro/F43/test1.txt):
+F43 diag: summary=RunSummary { sync_batches: 7, sync_events: 2, history_pages: 0, history_events: 0, rooms_completed: 0, gaps_repaired: 0, deferred: 0, unavailable: 1, rate_limits: 0, rejected: 0 } syncs_after_init=7 room1_create_refetches_after_init=0 room1_allowed=false healthy2_archived=1 room1_late_archived=0 last_sync_query_mentions_room1=false
+thread 'f43_transiently_unready_room_recovers_during_the_run' panicked at tests/repro_F43.rs:176:5:
+F43: ROOM stayed excluded for the whole run after a transient startup failure (allowed=false, late_archived=0, create re-fetches=0)
+test result: FAILED. 0 passed; 1 failed; ... finished in 4.05s
+
+Precondition asserts passed: ROOM was in report.unready after three 502s, and ROOM2 was in report.rooms. The harness sanity check passed: $healthy-2 from the same batch as $late-room1 was archived. The last_sync_query flag is a weak substring check on the URL-encoded inline filter and is only supporting evidence.
+
+Spec context: docs/architecture.md:95 says "a corrected response recovers on a later start". runtime.rs:731-732 says `refresh_rooms` "picks up newly ready rooms within one rotation".
+
+Test files: /dev/shm/repro/F43/repro_F43.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-5/tests/repro_F43.rs
+
+## F51 — REPRODUCED (agent severity: medium, confidence 0.85)
+
+**Reasoning.** Verified by running the test against the real MatrixTransport and the axum loopback mock homeserver, at PR head 9042860. The room is configured with `join = false`, which is the config.example.toml default. The bot's own membership is never observed and the create state is readable.
+
+What happened:
+- `initialize` reports the room as ready, with joined=[] and own_membership=None.
+- The first `run` backfills one page from the seeded `s5` cursor. That page has no `end`, so `complete` is set to true.
+- After a restart, which is the documented recovery path, the room is again reported ready. The runtime makes 3 `/sync` calls, none of which lists the room, and no further `/messages` call (1 in total across both runs).
+- The event posted later (`$later`) is never archived.
+- The `status` line reads `history=complete` with no membership, not-joined or history-only flag. The operator gets no signal that the room is not being followed.
+
+What is inferred, not verified:
+- The mock's default `/sync` response lists no rooms. That matches the Client-Server spec: /sync only has join/invite/leave/knock sections and no peeking. I did not check this against a live Synapse.
+- The premise that Synapse serves `m.room.create` state to non-members of world_readable rooms comes from the finding and I did not test it. Where a server refuses that state, the room goes unready and the bug does not trigger.
+- That `--retry-stalled` cannot recover the room comes from reading the code (it requires complete=0; verifier note 3). I did not run it.
+
+How it fits the spec:
+- The docs define "ready" narrowly as "metadata validates" (operations.md:39). They also explicitly endorse seeding idle rooms that are absent from /sync (architecture.md:142).
+- So admitting the room is consistent with the letter of the docs. It contradicts the README's "follow curated rooms" and the status contract's "membership/inactive/... flags".
+- The existing test `idle_configured_room_is_seeded_from_the_committed_token` already encodes this admission as intended behaviour.
+
+My severity is medium. Nothing is corrupted or crashes, but the archive is silently incomplete and looks complete, and that happens with the default config value for any readable room the bot hasn't joined. The fix is cheap: require join or observed membership, or flag the room as not-joined/history-only in the report and status.
+
+**Evidence.**
+
+Test: `f51_unjoined_world_readable_room_is_not_silently_reported_as_followed` in `tests/repro_F51.rs`, a new file using `mod common;`.
+
+Command: `cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-6 && CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F51 -- --nocapture`
+
+Output, from /dev/shm/repro/F51/test1.txt:
+```
+F51 run1 report: ready=["!room:hs.example.org"] joined=[] unready=[] own_membership=None
+F51 run1 after: $hist=1 complete=true own_membership=None
+F51 run2 report: ready=["!room:hs.example.org"] joined=[] unready=[]
+F51 status line: room !room:hs.example.org v11 configured=true events=1 messages=1 history=complete pages=1 gaps(open=0,unresolved=0)
+F51 after restart: $later=0 /messages calls total=1 /sync calls=3 own_membership=None complete=true
+panicked at tests/repro_F51.rs:206:5: F51: never-joined room was reported ready [...], marked history complete, and after restart the later event was not archived ($later=0) while status gives no not-joined indication
+test result: FAILED. 0 passed; 1 failed
+exit=101
+```
+
+The assertion expresses correct behaviour as: `$later` is archived, or the status line flags membership, not-joined, history-only or not-ready. Neither holds.
+
+Test files: /dev/shm/repro/F51/repro_F51.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-6/tests/repro_F51.rs
+
+## F74 — REPRODUCED (agent severity: medium, confidence 0.93)
+
+**Reasoning.** Verified by running the tests. I used the real MatrixTransport against the axum loopback mock homeserver, running the real runtime::initialize_with_policy and then runtime::run. The setup has an existing archive with committed since token s5 (applied before the room is configured). ROOM is then configured, and the mock serves the room's old m.room.encryption state (or m.room.tombstone) truthfully on GET /rooms/{room}/state/{type}/ and on full-state /state. I added those routes to tests/common/mod.rs, where missing state returns 404. The incremental /sync carries only a live m.room.encrypted timeline event and no old state, which is what the spec says an incremental sync does for an already-joined room. /messages from s5 returns one historical event.
+
+Results for both variants:
+- initialize admits the room with no flag, and the only state request made is /state/m.room.create/.
+- The encrypted case leaves rooms.encrypted=0; the tombstone case leaves successor_room_id=None.
+- Base backfill issues 2 /messages requests and archives the historical event. In the encrypted case that is the full ciphertext envelope $cipher-hist.
+
+This contradicts docs/operations.md ("an encrypted room, or a room with a known successor is flagged and skipped; no work is scheduled") and docs/architecture.md ("encrypted rooms and upgrade successors are flagged for operator action instead of being expanded").
+
+Inferred from code, not run:
+- A restart does not recover. The metadata fetch in initialize is gated on room_version_of(room).is_none() (runtime.rs:352), so once the version is stored nothing refetches state.
+- Backfill reaching the genuine m.room.encryption event deep in history would archive it without updating policy (apply_history_page does not touch the rooms policy columns), and that happens only after all the ciphertext pages.
+- The trigger assumes real homeservers do not resend old state in incremental sync when the filter's room list widens. This matches the spec's incremental-sync semantics, but I did not check it against Synapse.
+
+Severity medium: the result is silent privacy-policy drift (archiving E2EE envelopes with sender, device_id and session_id metadata, and expanding tombstoned rooms) under a realistic operator action, adding an already-joined room to config. There is no crash and no data loss.
+
+**Evidence.**
+
+Tests: f74_encrypted_room_admitted_after_first_sync_is_flagged_and_not_backfilled and f74_tombstoned_room_admitted_after_first_sync_is_flagged_and_not_backfilled, in the new file tests/repro_F74.rs. tests/common/mod.rs gained a MockState.room_state map plus routes /rooms/{room}/state/{event_type}[/] and /rooms/{room}/state; unknown state returns 404. The worktree is at PR head 9042860.
+
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-7 && CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F74 -- --nocapture --test-threads=1
+
+Output (/dev/shm/repro/F74/test1.txt):
+F74 initialize: rooms=["!room:hs.example.org"] unready=[] versions_learned=["!room:hs.example.org"]
+F74 encrypted: rooms.encrypted=0 hist_archived=1 messages_requests=2 state_requests=["/_matrix/client/v3/rooms/!room:hs.example.org/state/m.room.create/"]
+panicked at tests/repro_F74.rs:188:5: assertion `left == right` failed: encrypted room was never flagged  left: 0 right: 1
+F74 tombstone: successor=None hist_archived=1 messages_requests=2 state_requests=["/_matrix/client/v3/rooms/!room:hs.example.org/state/m.room.create/"]
+panicked at tests/repro_F74.rs:215:5: assertion `left == right` failed: tombstoned room's successor was never learned  left: None right: Some("!new:hs.example.org")
+test result: FAILED. 0 passed; 2 failed
+
+Root cause: runtime.rs:352-365 fetches only room_create_metadata, and only when no room version is stored. Policy flags are set only via apply_room_values (store.rs:1796), which never runs for history pages.
+
+Test files: /dev/shm/repro/F74/repro_F74.rs, /dev/shm/repro/F74/common_mod.rs, /dev/shm/repro/F74/common_mod.diff, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-7/tests/repro_F74.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-7/tests/common/mod.rs
+
+## G1 — REPRODUCED (agent severity: medium, confidence 0.9)
+
+**Reasoning.** Verified by running it: the real MatrixTransport sends `?format=event` for m.room.create. A response shaped like Synapse 1.134's (type, room_id, sender, state_key "", origin_server_ts, content.room_version "10", unsigned, and no event_id) is rejected with `m.room.create metadata has no event id`. That error is written as the room's metadata error, the room is left out of report.rooms, and room_version_of stays None. A second initialize with a new transport and the same store, standing in for a restart, sends the identical request and fails the same way, so nothing recovers it. The config has only that one room, so no room is admitted at all.
+
+Inferred, not run: that Synapse before 1.135 really leaves event_id out of this response for v3+ rooms. That rests on the finder's and verifiers' reading of Synapse source (synapse#15454, fixed by PR #18675 in 1.135.0). I did not run a real Synapse. The fixture copies the shape they describe: format_event_for_client_v2 over get_dict(), where v3+ event IDs are computed from the hash and not stored. Also inferred: the downstream effect that the run syncs forever with an empty rooms filter (F49). I did not drive the sync loop; runtime.rs:411-416 skipping allow_room for a room with no version is consistent with it.
+
+Harness note: the first run died with a SQLite disk I/O error because tempfile lives on the over-quota /tmp. I reran with TMPDIR=/dev/shm/repro/G1/tmp. Also, the mock's create-state queue pops one reply per request and then falls back to content-only `{room_version:"11"}`. My first attempt at the restart step therefore passed only because of that fallback, which is a mock artifact. The test now re-arms the old-Synapse reply before each run, which matches a real server answering the same way every time.
+
+My severity is medium. It is a deterministic, permanent bootstrap failure on any Synapse older than 1.135 (released 2025-08) for v3+ rooms, which in practice is every modern room. There is no data corruption, and the failure is loud (a metadata error and an unready room), but the ingester is useless on those servers until they upgrade. The fix is small: request the default content format, or accept an event-shaped reply without event_id as version-only.
+
+**Evidence.**
+
+Test: g1_pre_1_135_synapse_create_event_without_event_id_bootstraps (added to tests/adapter_tests.rs after create_state_bootstrap_handles_event_and_content_only, at PR head 9042860). It uses the axum loopback MockServer and the real MatrixTransport. The fixture is Synapse 1.134-shaped: {type:"m.room.create", room_id, sender, state_key:"", origin_server_ts, content:{creator, room_version:"10"}, unsigned:{age}}, with no event_id. The test runs runtime::initialize_with_policy twice, with a fresh transport and the same store, re-arming that reply before each run. It asserts no metadata error, room_version_of == "10", and ROOM in report.rooms.
+
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-8 && TMPDIR=/dev/shm/repro/G1/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test adapter_tests g1_pre_1_135_synapse_create_event_without_event_id_bootstraps -- --nocapture
+
+Output (/dev/shm/repro/G1/test3.txt):
+G1 attempt 1: rooms=[] unready=[("!room:hs.example.org", "m.room.create metadata has no event id")] version=None metadata_error=Some("m.room.create metadata has no event id")
+G1 attempt 2: rooms=[] unready=[("!room:hs.example.org", "m.room.create metadata has no event id")] version=None metadata_error=Some("m.room.create metadata has no event id")
+G1 create-state request: /_matrix/client/v3/rooms/!room:hs.example.org/state/m.room.create/ ?format=event
+G1 create-state request: /_matrix/client/v3/rooms/!room:hs.example.org/state/m.room.create/ ?format=event
+panicked at tests/adapter_tests.rs:503:9: attempt 1: pre-1.135 Synapse create event must not be a metadata error, got Some("m.room.create metadata has no event id")
+test result: FAILED. 0 passed; 1 failed
+
+Code path confirmed: matrix.rs:268 sets format=Event unconditionally. matrix.rs:538 treats an object as an event if it has a `type` key. matrix.rs:550-557 then rejects it for having no event_id, before the content.room_version check at :584 is reached.
+
+Test files: /dev/shm/repro/G1/adapter_tests.rs, /dev/shm/repro/G1/g1_test.diff, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-8/tests/adapter_tests.rs
+
+## G3 — REPRODUCED (agent severity: medium, confidence 0.95)
+
+**Reasoning.** Reproduced at PR head 9042860 with an engine-level test that uses FakeTransport and a tempfile Store. The test was run by name only.
+
+Setup (via the real engine API):
+- ROOM is configured with room version 11.
+- s1 seeds the base cursor at p1.
+- One base page moves the cursor from p1 to p1b, so backfill is in progress.
+- s2 is a limited sync that opens gap A.
+- s3 is a limited sync that carries m.room.tombstone in state with prev_batch p3.
+
+Sanity asserts that passed:
+- status() reports successor_room_id = !next:hs.example.org.
+- Exactly 2 open gaps exist, and gap G (cursor p3) was inserted by the same sync that carried the tombstone. This confirms that apply_sync_room creates the gap without a policy check.
+
+After the tombstone, every path that should continue the predecessor's static, readable history is dead:
+- base_history_request(ROOM) returns None.
+- gap_history_request returns None for both gap A and gap G.
+- run_room_history_once makes no new transport request and fetches 0 pages.
+- A fresh engine on the same archive (restart) still returns None.
+- After mark_history_stalled, retry_stalled_configured returns {base: 0, gaps: 0}.
+
+Nothing short of hand-edited SQL recovers the room.
+
+Verified empirically: all of the above.
+
+Verified by grep: the behaviour is documented in docs/operations.md:116 ("successor is flagged and skipped; no work is scheduled"). The finding's "undocumented" claim is wrong, as both verifiers said. architecture.md:147-148, 367-368 and 384 talk only about not expanding or following the successor and not stitching across rooms. Only operations.md turns that into abandoning the predecessor.
+
+Inferred, not tested (would need a real Synapse):
+- /messages on the old room stays readable after an upgrade. This is standard server behaviour, since the bot is still joined.
+- So the frozen work is recoverable in principle, and dropping it defeats the backfill goal.
+
+Severity: medium. Nothing crashes and no data is corrupted, but after an upgrade the archive's history of a configured room is left permanently incomplete. Room upgrades are a routine admin action. Gap G, created at the moment of upgrade, is dead on arrival. Because the policy is documented, this is a design defect, not a hidden bug. The existing test disabled_rooms_make_no_sequential_history_requests (tests/engine_tests.rs:745) asserts the current behaviour for the "upgraded" case, so a fix would have to change that test.
+
+**Evidence.**
+
+Test: g3_tombstone_does_not_freeze_predecessor_history in tests/repro_G3.rs, which is new and uses `mod common;`.
+
+Command (TMPDIR was needed because /tmp is over quota, and tempfile otherwise fails with SQLite "disk I/O error"):
+cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-9 && TMPDIR=/dev/shm/repro/G3/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_G3 g3_tombstone_does_not_freeze_predecessor_history -- --nocapture > /dev/shm/repro/G3/test2.txt 2>&1
+
+Output (/dev/shm/repro/G3/test2.txt):
+G3: base_history_request after tombstone = None
+G3: gap_history_request(A) after tombstone = None
+G3: gap_history_request(G) after tombstone = None
+G3: run_room_history_once after tombstone = RoomHistoryOutcome { pages_fetched: 0, events_stored: 0, completed: false, stalled: false }, transport history calls = 1   [the 1 call is the pre-tombstone p1 page]
+G3: base_history_request after restart = None
+G3: retry_stalled_configured = RetryStalledOutcome { base: 0, gaps: 0 }
+panicked at tests/repro_G3.rs:148:5:
+G3 reproduced; predecessor history frozen by tombstone:
+  - base_history_request(ROOM) is None after tombstone (cursor p1b frozen)
+  - gap_history_request(gap A) is None after tombstone
+  - gap_history_request(gap G) is None after tombstone
+  - run_room_history_once fetched 0 pages for the predecessor
+  - restart does not resume predecessor base backfill
+  - --retry-stalled resumed nothing for the tombstoned predecessor: RetryStalledOutcome { base: 0, gaps: 0 }
+test result: FAILED. 0 passed; 1 failed
+
+The sanity asserts passed before the checks above ran: successor_room_id is Some("!next:hs.example.org"), there are 2 open gaps, and gap G has token p3.
+
+Code paths involved:
+- src/store.rs room_history_allowed_conn: `!encrypted && !upgraded && ...`
+- retry_stalled_configured eligible set: `AND successor_room_id IS NULL`
+- Limited-sync gap INSERT: no policy check
+
+Docs: operations.md:116 "successor is flagged and skipped; no work is scheduled", so the behaviour is documented. architecture.md:367-368 and 384 limit the exclusion to stitching and following the successor.
+
+Test files: /dev/shm/repro/G3/repro_G3.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-9/tests/repro_G3.rs
+
+## F9 — REPRODUCED (agent severity: low, confidence 0.95)
+
+**Reasoning.** Verified by running a test at PR head 9042860. The test uses the real Store::apply_sync_batch path with a single room-v11 sync batch containing four events. Alice's $a has the body "my token is hunter2". Bob's reply $b carries a spec-format legacy reply fallback: a "> <@alice> ..." line in body, an <mx-reply> block in formatted_body, and m.relates_to.m.in_reply_to=$a. The last event is Alice's v11 redaction of $a. Sanity checks passed: $a's body_text is pruned (NULL, and its raw content is {} in the export), and $b's relates_to_event_id = $a. So the redaction machinery works on the target itself.
+
+The test then asserts that "hunter2" appears in none of the places the finding names. It appears in all five: events.body_text, events.raw_json (both body and formatted_body), current_messages.body, export --kind messages, and export --kind events. That confirms the mechanism exactly as the finding and both verifiers describe it. normalize_inner copies content.body verbatim (event.rs:198-201). The in_reply_to arm stores only relation metadata. canonical_raw keeps formatted_body. Redaction never revisits replies.
+
+Inferred, not tested: that the same thing happens on the history/backfill path. It shares normalize and the store, so the result should be the same.
+
+Severity: low. I agree with the verifiers' downgrade. The quoted text is Bob's own signed, unredacted event content, which the homeserver still serves and legacy clients still render. The doc sentence at architecture.md:349 literally covers only the redacted event's own raw JSON, and that part holds. It is not a resurrection bug in the store. It is a gap in the design and in the docs. The pipeline feeds an LLM corpus, and redacted parent text persists in the projection and the messages export (and adds noise there too). Stripping fallbacks from body_text/current_messages.body (per MSC2781 / spec v1.13) is cheap and worth doing. Whether to rewrite raw_json is debatable. At minimum the doc claim should be narrowed to say that quoted copies inside other users' events are not covered.
+
+**Evidence.**
+
+Test: f9_reply_fallback_does_not_resurrect_redacted_parent_text in tests/repro_F9.rs (new file, uses `mod common;`, with the open_store/room_update/message/redaction/sync_batch helpers).
+Command (worktree at 9042860; TMPDIR is needed because tempfile under /tmp fails with a disk I/O error from the quota): TMPDIR=/dev/shm/repro/F9/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F9 f9_reply_fallback_does_not_resurrect_redacted_parent_text -- --nocapture
+Output (/dev/shm/repro/F9/test2.txt):
+events.body_text = Some("> <@alice:hs.example.org> my token is hunter2\n\nplease rotate that")
+current_messages.body = Some("> <@alice:hs.example.org> my token is hunter2\n\nplease rotate that")
+export messages: {"body":null,...,"event_id":"$a",...,"redacted":true,...}
+                 {"body":"> <@alice:hs.example.org> my token is hunter2\n\nplease rotate that",...,"event_id":"$b",...,"relation_type":"m.in_reply_to",...}
+export events: $a raw {"content":{},...,"redacted":true}; $b raw content still has body + formatted_body "<mx-reply>...<br>my token is hunter2</blockquote></mx-reply>please rotate that"
+panicked at tests/repro_F9.rs:103:5: redacted parent text 'hunter2' survives via reply fallback in: ["events.body_text", "events.raw_json", "current_messages.body", "export --kind messages", "export --kind events"]
+test result: FAILED. 0 passed; 1 failed
+
+Test files: /dev/shm/repro/F9/repro_F9.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-10/tests/repro_F9.rs
+
+## F17 — REPRODUCED (agent severity: low, confidence 0.93)
+
+**Reasoning.** Verified empirically with paused-time runtime tests (ControllableTransport; the real runtime::run coordinator at PR head 9042860). I wrote two assertions of spec-correct behaviour and two controls, all in tests/repro_F17.rs.
+
+(a) One room's /messages keeps returning TransportError::Transient while /sync is healthy and returns useful batches every 100ms. architecture.md:106-107 says "an active backfill never blocks a live batch", and :244 says "a transient failure defers only that work item". Result: the live plane dropped from 99 /sync requests in 10s (control, history off) to 9, with 1.19s between consecutive syncs. Each history Deferred calls extend_backoff on the shared backoff_until, and runtime.rs:552-553 gates new /sync on that deadline. The history retry cadence also stays flat at about 1.19s and never escalates, because each sync success zeroes the shared transient_attempt (runtime.rs:616). So a failing /messages item is hammered about once a second indefinitely: 9 retries in 10s, none stalled.
+
+(b) /sync fails transiently every time while history pages succeed. "Transient failures back off with bounded exponential delay" is not honoured: 23 /sync attempts in 30s at about 1.19s spacing (history Continue resets the counter at runtime.rs:672). The control with history off shows proper escalation: 5 attempts at 0, 1190, 3303, 8290, 17194 ms. The coupling also runs the other way: failing sync backoff slows history pacing from 1.0s to about 1.19s.
+
+The controls pass, so the two failures come from the shared backoff and counter, not from test setup.
+
+Inferred, not tested: real-world impact. Nothing is lost in either case. Scenario (a) adds about 1-1.25s of latency to each live batch while a poison room exists; the limited-sync feedback loop only matters for rooms busier than the timeline limit within that window. The 60s-escalation variant in the finding does not occur while sync succeeds, because sync success keeps resetting the counter to 1s. Scenario (b) costs request rate and fsync'd failure writes (about 1/s instead of backing off to 60s) for as long as history work exists. The claim that the existing transient test is vacuous (runtime_tests.rs:338-341 asserts at least 500ms while pacing is 1000ms) is consistent with the observed timings, but I did not mutate the code to check it. Given the doc contradictions but no data loss, my severity is low (upper end of low).
+
+**Evidence.**
+
+Command (run from worktree /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-11 at detached 9042860; TMPDIR was needed because tempfile under /tmp fails with a disk I/O error):
+TMPDIR=/dev/shm/repro/F17/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F17 -- --nocapture --test-threads=1   (output: /dev/shm/repro/F17/test3.txt)
+
+test f17_control_live_sync_cadence_without_history ... control(a): sync requests in 10s: 99, max gap 100ms  -> ok
+test f17_control_sync_backoff_escalates_without_history ... control(b): failing sync requests in 30s: 5 at [0, 1190, 3303, 8290, 17194]  -> ok
+test f17_history_transient_failure_does_not_delay_live_sync:
+  sync requests in 10s: 9
+  sync request times (ms): [0, 1190, 2380, 3570, 4760, 5950, 7140, 8330, 9520]
+  history request times (ms): [0, 1090, 2280, 3470, 4660, 5850, 7040, 8230, 9420]
+  panicked at tests/repro_F17.rs:103:5: a transient /messages failure delayed the next live /sync by 1.19s  -> FAILED
+test f17_sync_transient_backoff_escalates_while_history_succeeds:
+  RunSummary { sync_batches: 0, history_pages: 23, deferred: 23, .. }
+  sync request times (ms): [0, 1190, 2380, 3570, 5683, 6873, 8063, 9253, 10443, ... 27759, 28949]
+  panicked at tests/repro_F17.rs:208:5: a persistently failing /sync must back off exponentially; got 23 attempts in 30s  -> FAILED
+test result: FAILED. 2 passed; 2 failed
+
+Code responsible: runtime.rs:547-548 (a single backoff_until and transient_attempt for both planes), :552-553 (/sync issuance gated on backoff_until), :616 and :672 (either plane's success resets the counter), :673-684 (history Deferred extends the shared backoff).
+
+Test files: /dev/shm/repro/F17/repro_F17.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-11/tests/repro_F17.rs
+
+## F16 — REPRODUCED (agent severity: low, confidence 0.95)
+
+**Reasoning.** Verified empirically, end to end, through the real MatrixTransport (matrix-sdk and ruma deserialization) against the axum loopback mock homeserver, then through Store::apply_sync_batch.
+
+Setup:
+- Sync 1 is the initial sync: the room is joined, prev_batch is p0, and s1 is committed.
+- Sync 2 (since s1) returns the room under rooms.leave with timeline.limited=true, prev_batch="p_leave", and events [message, own leave member].
+
+Observed on the PR head (9042860):
+- The adapter emits SyncRoomUpdate{limited=false, prev_batch=None}.
+- apply_sync_batch reports gaps_opened=0, and gap_jobs holds 0 rows for the room.
+- The server's truncation signal and its bounding token never reach the store. Nothing records the gap: no open job and no 'limited_sync_no_prev_batch' unresolved one. This contradicts docs/architecture.md: after the first sync a limited sync creates a bounded repair job, and a limited sync without prev_batch "is recorded unresolved and never claims coverage".
+
+Control, verified: I patched matrix.rs left_room to pass room.timeline.limited and prev_batch.clone() through, then reverted the patch. The same test then passes:
+- The adapter reports limited=true, prev_batch=Some("p_leave").
+- gaps_opened=1 and gap_jobs has 1 row.
+
+So the store's leave handling does not suppress the gap on its own. The loss is caused entirely by the hard-coded values at matrix.rs:464-465, and the suggested fix is sufficient to record it.
+
+Inferred, not tested:
+- Synapse really sets limited/prev_batch on leave-transition timelines. This matches ruma's LeftRoom.timeline doc, but I did not check it against a live server.
+- Downstream, left rooms have history disabled (room_history_allowed=false), so even with the fix an open job would not be repaired while the bot is out. The practical gain is honest coverage reporting, plus a repairable bound after a rejoin, if policy allows repairing left rooms.
+
+Severity is low. It needs a kick, ban or leave plus more than 20 events since the last sync. It is silent data loss with an overstated coverage claim, but it is confined to the window just before the bot lost access.
+
+**Evidence.**
+
+Test: repro_f16_limited_leave_timeline_records_a_gap, appended to tests/adapter_tests.rs. It uses the real MatrixTransport against the MockServer.
+
+Command:
+cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-12 && touch tests/adapter_tests.rs && TMPDIR=/dev/shm/repro/F16/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test adapter_tests repro_f16_limited_leave_timeline_records_a_gap -- --nocapture
+
+Two setup fixes were needed:
+- TMPDIR is set because tempfile on /tmp hits the quota and SQLite fails with "disk I/O error".
+- touch is needed because the shared target dir served a stale binary on the first run (0 tests matched).
+
+PR head output (/dev/shm/repro/F16/test3.txt):
+F16 adapter SyncRoomUpdate for left room: limited=false prev_batch=None own_membership=Some("leave")
+F16 apply outcome gaps_opened=0
+F16 gap_jobs rows for room after limited leave sync: 0
+panicked at tests/adapter_tests.rs:1672:5: limited leave sync (server limited=true, prev_batch=p_leave) left no gap_jobs row (open or unresolved); adapter reported limited=false prev_batch=None
+test result: FAILED. 0 passed; 1 failed
+
+Control, with matrix.rs:464-465 changed to `prev_batch: room.timeline.prev_batch.clone(), limited: room.timeline.limited` (reverted afterwards; git status shows only tests/adapter_tests.rs modified). Output in /dev/shm/repro/F16/test_control.txt:
+F16 adapter SyncRoomUpdate for left room: limited=true prev_batch=Some("p_leave") own_membership=Some("leave")
+F16 apply outcome gaps_opened=1
+F16 gap_jobs rows for room after limited leave sync: 1
+test repro_f16_limited_leave_timeline_records_a_gap ... ok
+
+Test files: /dev/shm/repro/F16/adapter_tests.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-12/tests/adapter_tests.rs
+
+## F1 — REPRODUCED (agent severity: medium, confidence 0.93)
+
+**Reasoning.** Verified by running code at PR head 9042860:
+(1) Runtime level. I used paused time with the ControllableTransport and a wrapper that records `since`. Two ready rooms are seeded, and the committed token is s2. The server answers since=s2 with a batch that holds a healthy message in ROOM and, in ROOM2, a timeline event that has a string type but no event_id. runtime::run returns Err(Engine(Store(MalformedEvent{room2, <missing>}))). The healthy room's event is rolled back (0 rows) and since_token stays at s2. I then simulated a supervisor restart by reopening the same DB. The restart requests since=s2 again, gets the same batch and dies with the same error. That is a deterministic crash loop, and live ingest stops for every room, including ones with nothing wrong with them.
+(2) Reachability through the production adapter. The real MatrixTransport (matrix-sdk Client::send against the axum loopback mock) accepts the sync response, and select_events keeps the event that has no event_id and passes it to the store. apply_sync_batch then fails with MalformedEvent and rolls back the healthy room's $healthy event. So the SDK and the adapter do not filter this trigger out.
+Not verified (inferred): how often a conformant Synapse would emit such an event. I also did not drive the UnknownRedactionRoomVersion trigger. Verifier 2 argues it is unreachable on sync because of the allow-set/version validation gate, and I did not test that claim.
+Spec position: docs/architecture.md:193-194 explicitly promises that a malformed envelope rolls back the whole batch and that the cursor does not advance. The per-batch rollback itself is therefore intended behaviour. The docs do not disclose the consequence: the daemon exits, and every restart re-fetches the same batch and wedges live ingest for all rooms, with no quarantine, skip or operator reset. That contrasts with the documented per-room isolation for startup (architecture.md:152) and history (architecture.md:239-243, runtime.rs is_room_local_store_error), and it breaks the "others proceed" spirit.
+Severity: medium, not low. One bad PDU relayed by a buggy or hostile server permanently halts all live archiving until someone edits SQLite by hand. The only mitigation is the low frequency of the trigger against a conformant homeserver. The fix belongs on the sync plane: per-room or per-event quarantine that still commits next_batch for the healthy rooms, or at minimum an operator skip/reset command plus a documented limitation.
+
+**Evidence.**
+
+Setup: git checkout 9042860c2 (HEAD 9042860). The new file is tests/repro_F1.rs, which uses `mod common;`.
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-13 && TMPDIR=/dev/shm/repro/F1/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F1 f1_ -- --nocapture --test-threads=1 > /dev/shm/repro/F1/test3.txt 2>&1
+(TMPDIR had to be redirected because /tmp is over quota and tempfile's SQLite hit "disk I/O error".)
+
+Test f1_one_malformed_sync_event_must_not_wedge_live_ingest_for_all_rooms FAILED (it asserts the correct behaviour):
+lifetime 1: result=Err(Engine(Store(MalformedEvent { room_id: "!room2:hs.example.org", event_id: "<missing>", reason: "event is missing a string `event_id`" }))) since_requested=[Some("s2")]
+lifetime 2: result=Err(Engine(Store(MalformedEvent { room_id: "!room2:hs.example.org", event_id: "<missing>", reason: "event is missing a string `event_id`" }))) since_requested=[Some("s2")]
+healthy room event archived rows=0 committed since_token=Some("s2")
+panicked at tests/repro_F1.rs:232:5: a single malformed event in ROOM2 killed the daemon on every restart
+
+Test f1_reachability_real_adapter_passes_event_without_event_id PASSED (a pass means the trigger is reachable through the real MatrixTransport and matrix-sdk):
+F1 ADAPTER: ROOM2 timeline delivered = [Object {"content": ..., "origin_server_ts": Number(101), "sender": String("@alice:hs.example.org"), "type": String("m.room.message")}]
+F1 ADAPTER: apply_sync_batch error = MalformedEvent { room_id: "!room2:hs.example.org", event_id: "<missing>", reason: "event is missing a string `event_id`" }
+The $healthy row count after rollback is 0 (asserted).
+test result: 1 passed; 1 failed. Full output is in /dev/shm/repro/F1/test3.txt.
+Code path: runtime.rs `match engine.apply_sync_result(result, now_unix_ms())? {` -> engine.rs:273 `self.store.apply_sync_batch(&batch, received_at)?`. Unlike the history arm, the sync arm has no is_room_local_store_error handling, and main.rs `.context("live ingestion stopped")?` exits the process.
+
+Test files: /dev/shm/repro/F1/repro_F1.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-13/tests/repro_F1.rs
+
+## F3 — REPRODUCED (agent severity: medium, confidence 0.95)
+
+**Reasoning.** Verified by running the tests at PR head 9042860. An m.replace edit whose m.new_content has a body but no msgtype, sent by the same sender as the original, is never suppressed when the original is redacted. This holds in both arrival orders:
+(a) the edit is stored before the redaction, in the same batch;
+(b) the original is redacted in batch 1 and the invalid edit arrives in a later batch, as in backfill.
+
+In both cases events.body_text keeps the "* <secret>" fallback. raw_json keeps both content.body and m.new_content.body verbatim, and export_events emits the secret.
+
+A control test with the identical shape plus m.new_content.msgtype passes: body_text is NULL, raw_json is pruned to {"content":{}} and the export is clean. That isolates the cause to the edit_target gate, where edit_target is None for structurally invalid edits:
+- store.rs:2034-2037 (replacement_target_redacted);
+- store.rs:2240-2241 (suppress_replacement_bodies WHERE edit_target = ?2).
+
+This contradicts docs/architecture.md, which says redacting an original suppresses its replacements' bodies whatever the arrival order. The documented limit 'Edit validity is structural' covers projection, not retention.
+
+Inferred, not tested: the edit-of-edit (no recursion) sub-claim, and other invalid shapes such as a non-string body or a missing m.new_content. They go through the same code path, and I expect the same result.
+
+Severity: I rate it medium rather than low. It is a concrete breach of a documented privacy and retention guarantee, and the secret reaches exports. The trigger needs a malformed edit from a buggy client or bridge, and Element-style clients redact only the original, so an operator relying on the guarantee would not notice.
+
+Environment note: the tests needed TMPDIR=/dev/shm/repro/F3/tmp. The first run failed with a SQLite disk I/O error because /tmp is over quota. That was an environment problem, not a finding.
+
+**Evidence.**
+
+Added three tests at the end of tests/store_tests.rs, with helper invalid_edit_no_new_msgtype. The edit content is {msgtype:m.text, body:"* <secret>", m.new_content:{body:<secret>}, m.relates_to:{rel_type:m.replace, event_id:$orig}} from sender ALICE.
+- f3_invalid_edit_stored_first_is_suppressed_by_redaction_of_original
+- f3_invalid_edit_arriving_after_original_redaction_is_suppressed
+- f3_control_valid_edit_is_suppressed
+
+Command: cd worktree && TMPDIR=/dev/shm/repro/F3/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test store_tests f3_ -- --nocapture --test-threads=1
+
+Output (/dev/shm/repro/F3/test2.txt):
+test f3_control_valid_edit_is_suppressed ... F3 $good: body_text=None
+F3 $good: raw_json={"content":{},"event_id":"$good",...}
+F3 $good: export_contains_secret=false
+ok
+test f3_invalid_edit_arriving_after_original_redaction_is_suppressed ... F3 $bad: body_text=Some("* late-token-xyz")
+F3 $bad: raw_json={"content":{"body":"* late-token-xyz","m.new_content":{"body":"late-token-xyz"},"m.relates_to":{"event_id":"$orig","rel_type":"m.replace"},"msgtype":"m.text"},...}
+F3 $bad: export_contains_secret=true
+panicked at tests/store_tests.rs:4331:5: F3: invalid edit body_text survived redaction of the original: Some("* late-token-xyz")
+FAILED
+test f3_invalid_edit_stored_first_is_suppressed_by_redaction_of_original ... F3 $bad: body_text=Some("* token-abc123")
+F3 $bad: raw_json={"content":{"body":"* token-abc123","m.new_content":{"body":"token-abc123"},...}
+F3 $bad: export_contains_secret=true
+panicked at tests/store_tests.rs:4331:5: F3: invalid edit body_text survived redaction of the original: Some("* token-abc123")
+FAILED
+test result: FAILED. 1 passed; 2 failed
+
+Precondition asserted in the stored-first test: the original's events.redacted = 1.
+
+Code: store.rs:2034-2037 is `match &event.edit_target { Some(target) => target_is_redacted(..), None => false }`, and store.rs:2240-2241 is `WHERE room_id = ?1 AND edit_target = ?2 AND redacted = 0`.
+
+Test files: /dev/shm/repro/F3/store_tests.rs, /dev/shm/repro/F3/f3_tests_snippet.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-14/tests/store_tests.rs
+
+## F10 — REPRODUCED (agent severity: low, confidence 0.95)
+
+**Reasoning.** Verified by running two tests at PR head 9042860, using the store's own public API (apply_sync_batch) and a tempfile SQLite archive.
+(a) The sync batch is [create v11, $orig, $bad (an m.replace of $orig whose m.new_content has no msgtype), R redacting $bad]. The test first checks a precondition, which passed: events.edit_attempt=1 for $bad. Even so, current_messages ends up with a row for $bad.
+(b) The sync batch is [create v11, $orig, $bad (same invalid edit), $e2 (a valid same-sender m.replace targeting $bad)]. current_messages gets a row for $bad with body "edit of an edit". So the invalid edit is projected as a live message carrying E2's text, not just a redacted placeholder. That is worse than verifier 1 assessed: verifier 1 said the phantom row always has body NULL, and that holds only for scenario (a).
+Both results contradict architecture.md: "Invalid edits are stored, never projected and never become messages". The cause, from reading the code rather than instrumenting it: project_event (store.rs:2276) guards only on edit_target, and get_event_row does not load edit_attempt. The only edit_attempt guard sits at the self-refresh site (store.rs:2159), so refreshes triggered by a redaction (store.rs:2145) or by an edit targeting the event (store.rs:2151) bypass it.
+Scenarios (c) (bundle promotion clearing edit_target) and (d) were not tested; they are inferred from the code only.
+Severity: low. It needs a sender to emit a malformed m.replace and then either redact it or edit that edit. The damage is an extra row in exports and status counts. In (b) that row is a bogus "original" carrying an edit's text, which is misleading but leaks nothing beyond content the sender already sent.
+Environment note: tempfile needed TMPDIR=/dev/shm/repro/F10/tmp because /tmp is over quota. The first run failed with a SQLite disk I/O error, which was unrelated to the finding.
+
+**Evidence.**
+
+Test file: /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-15/tests/repro_F10.rs (copied to /dev/shm/repro/F10/repro_F10.rs). Tests: f10_redacting_an_invalid_edit_does_not_project_it, f10_valid_edit_targeting_an_invalid_edit_does_not_project_it.
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-15 && TMPDIR=/dev/shm/repro/F10/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F10 > /dev/shm/repro/F10/test2.txt 2>&1
+Output (/dev/shm/repro/F10/test2.txt):
+---- f10_valid_edit_targeting_an_invalid_edit_does_not_project_it stdout ----
+panicked at tests/repro_F10.rs:88:5:
+assertion `left == right` failed: an invalid edit must never become a current_messages row (phantom body: Some("edit of an edit"))
+  left: 1
+ right: 0
+---- f10_redacting_an_invalid_edit_does_not_project_it stdout ----
+panicked at tests/repro_F10.rs:53:5:
+assertion `left == right` failed: an invalid edit must never become a current_messages row, even after it is redacted
+  left: 1
+ right: 0
+test result: FAILED. 0 passed; 2 failed
+In test (a), the precondition assert (edit_attempt=1 for $bad, line 48) passed before the failing assert. The invalid-edit fixture has the same shape as the existing passing test replacement_without_msgtype_is_never_projected. Code cause: store.rs:2276 checks only `event.edit_target.is_some()`; the refresh paths are store.rs:2145 (redaction target) and store.rs:2151-2152 (edit_target of an incoming valid edit).
+
+Test files: /dev/shm/repro/F10/repro_F10.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-15/tests/repro_F10.rs
+
+## F48 — REPRODUCED (agent severity: low, confidence 0.97)
+
+**Reasoning.** What I verified: I ran the real `mln-ingest` binary twice (via CARGO_BIN_EXE, in `follow` mode) against the loopback axum mock homeserver, whose whoami returns device "MLN". I copied the setup from tests/cli_live_tests.rs.
+- Run 1 used config device_id "MLN-INGEST". It exited non-zero with the whoami identity mismatch, and no /sync request was ever made.
+- The archive was still created. archive_meta holds device_id="MLN-INGEST" and there are 0 events. sync_progress has 1 row, which I infer is the schema's seeded singleton, not a real cursor, since no sync ran.
+- Run 2 used the corrected device_id "MLN". Store::open refused it with StoreError::IdentityMismatch, "refusing to reuse its cursors", and live sync was never reached.
+
+So the binding is written from unverified config before whoami (main.rs:152 comes before runtime::initialize at main.rs:155, and the INSERT is at store.rs ensure_binding). The corrected config is then permanently refused.
+
+The diagnostics were also confirmed from the output:
+- Both whoami-failure lines render as "@ingest:hs.example.org/<device id redacted>", so the message reads as X does not match X.
+- The run-2 error is also X != X, with identical homeserver/user and both devices redacted. The operator gets no hint that the archive is empty and safe to delete.
+
+What I inferred: a user_id typo behaves the same way, since the same ensure_binding path compares user_id, but I did not run it.
+
+Severity is low. Nothing is lost or corrupted: it is a clean refusal of an empty archive, fixed by deleting the file. But it is a real first-run papercut, and the diagnostic is actively misleading. It also contradicts the spirit of docs/operations.md, which says failures in startup steps 1-5 refuse the run cleanly; here step 4 leaves persistent state that blocks the corrected config. Fix: run whoami before Store::open, or open the store unbound, verify, then bind.
+
+A note on the environment: the first attempt failed with SQLite disk I/O error 778 because /tmp is over its quota. That is unrelated to the finding, and I re-ran with TMPDIR=/dev/shm/repro/F48/tmp.
+
+**Evidence.**
+
+Test: f48_first_run_device_typo_must_not_brick_the_archive_for_the_corrected_config in tests/repro_F48.rs (worktree /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-16, HEAD 9042860).
+Command: cd <worktree> && TMPDIR=/dev/shm/repro/F48/tmp CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F48 f48_first_run_device_typo_must_not_brick_the_archive_for_the_corrected_config -- --nocapture
+Output (/dev/shm/repro/F48/test2.txt):
+RUN1 status=ExitStatus(unix_wait_status(256))
+RUN1 stderr: error: validating identity and the configured rooms: archive/config identity @ingest:hs.example.org/<device id redacted> does not match the token's server identity @ingest:hs.example.org/<device id redacted>
+after run1: archive exists=true archive_meta rows=Some(1) device_id=Some("MLN-INGEST") sync_progress rows=Some(1) events=Some(0)
+RUN2 stderr: error: opening archive /dev/shm/repro/F48/tmp/.tmptVDC76/data/archive.sqlite3: archive is bound to http://127.0.0.1:39241/@ingest:hs.example.org/<device id redacted>; refusing to reuse its cursors for http://127.0.0.1:39241/@ingest:hs.example.org/<device id redacted>
+panicked at tests/repro_F48.rs:124:5: the corrected config must not be refused by a binding written from the unverified first-run identity
+test result: FAILED. 0 passed; 1 failed
+Run 1 also made 0 /sync requests (assert_eq passed), so the archive was bound without any sync.
+
+Test files: /dev/shm/repro/F48/repro_F48.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-16/tests/repro_F48.rs
+
+## F41 — REPRODUCED (agent severity: low, confidence 0.95)
+
+**Reasoning.** Verified empirically at PR head 9042860. Both tests use the real MatrixTransport, the real matrix-sdk and ruma parsing, and the axum loopback mock homeserver. Neither uses a fake transport.
+
+(1) Wrap. A 429 with header `Retry-After: 18446744073709552` comes out of transport.sync() as RateLimited { retry_after_ms: Some(384) }, exactly the value the finding predicted. This breaks the spec's promise that "A delay is never capped, shortened or skipped". It is a clear defect in retry_after_ms() at src/matrix.rs:684-692 (`delay.as_millis() as u64`).
+
+(2) Past HTTP date. A 429 whose Retry-After is an HTTP date in the past maps to Some(0). In the runtime's sync plane, rate_delay applies that hint with no floor and sets next_sync_at = backoff_until ≈ now. I ran the real runtime::run in follow mode for 1 s of wall-clock time with 500 such 429s queued. It sent 501 /sync requests: all 500 429s were consumed (summary.rate_limits = 500), then one empty 200. Each 429 also goes through record_sync_failure; that it is an fsync'd write is inferred from the finding's code reading, not measured. The loop is bounded only by round-trip speed and how many 429s the server sends.
+
+Whether (2) is a bug is partly a policy question. The spec says the runtime honours an HTTP-date Retry-After, and a past date literally means "now". But the SDK treats DateTime hints as no hint, and a server returning 429 wants less traffic, not 500 requests per second. A floor (for example max(hint, 1s), or treating a past or zero hint as absent so the 30 s fallback applies) never shortens a real hint. The same Some(0) path applies to a body `retry_after_ms: 0`. I inferred that from the code and did not test it.
+
+Not verified: the history plane's behaviour on a zero hint. The global 1 s history pacing probably bounds it, but I did not test that.
+
+Severity: low. (1) needs a hostile or broken server sending an absurd header. (2) needs clock skew or a stale proxy date together with a server that keeps returning 429. The effect is extra load on a server that is already rate-limiting us, not data loss.
+
+**Evidence.**
+
+Test file: tests/repro_f41.rs (copied to /dev/shm/repro/F41/repro_f41.rs).
+
+Command: cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-17 && CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_f41 f41_ -- --nocapture --test-threads=1 > /dev/shm/repro/F41/test1.txt 2>&1
+
+Output (/dev/shm/repro/F41/test1.txt):
+test f41_huge_retry_after_header_is_not_wrapped ... F41 huge header -> Err(RateLimited { retry_after_ms: Some(384) })
+panicked at tests/repro_f41.rs:67:15: a ~584-million-year Retry-After was shortened to 384 ms
+FAILED
+
+test f41_past_http_date_retry_after_does_not_hot_loop_sync ... F41 past-date: 501 /sync requests in 1s; summary=Ok(RunSummary { sync_batches: 1, sync_events: 0, history_pages: 0, history_events: 0, rooms_completed: 0, gaps_repaired: 0, deferred: 0, unavailable: 0, rate_limits: 500, rejected: 0 })
+panicked at tests/repro_f41.rs:112:5: a 429 with a past Retry-After date caused 501 /sync requests in one second
+FAILED
+
+test result: FAILED. 0 passed; 2 failed
+
+Root cause: src/matrix.rs:684-692
+  RetryAfter::Delay(delay) => delay.as_millis() as u64,
+  RetryAfter::DateTime(time) => time.duration_since(SystemTime::now()).map(|d| d.as_millis() as u64).unwrap_or(0),
+Contributing code: src/runtime.rs:1010-1014 applies a present hint with no floor (`Some(ms) => Duration::from_millis(ms)`). The sync RateLimited arm (runtime.rs:633-638) sets next_sync_at = backoff_until; the empty_sync_floor applies only in the Applied arm.
+
+Test files: /dev/shm/repro/F41/repro_f41.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-17/tests/repro_f41.rs
+
+## F65 — REPRODUCED (agent severity: low, confidence 0.93)
+
+**Reasoning.** Verified by running a test: after the startup path records a validated version "11" via set_room_version_control, a later sync batch whose state block carries an m.room.create with room_version "99" commits without error. apply_room_values takes any string, and the upsert COALESCE(excluded, existing) lets the new value win. The stored version becomes "99" and the since token moves to s1. After a store reopen (simulating a restart), a normal v11 redaction batch fails with MalformedEvent (UnknownRedactionRoomVersion "99"), and replaying the same batch fails the same way. The since token stays at s1, so there is no self-recovery. Inferred from code but not run: runtime.rs:612 propagates this error with `?`, which ends the run, so each restart replays the same since token and wedges. I did not re-trace a --retry-stalled path, because the version lives in rooms.room_version, which nothing resets. Reachability: only a buggy or malicious homeserver can send this, because auth rules reject a second create. The adapter does pass sync state events through select_events, including create. Severity is low: it is an availability wedge that only the server can trigger, with no data loss. It also asymmetrically bypasses the strict validate_room_version the startup path enforces. The fix is small: validate here, or use COALESCE(rooms.room_version, excluded.room_version) to match set_room_version_control.
+
+**Evidence.**
+
+Test: f65_sync_create_cannot_replace_validated_room_version in tests/repro_f65.rs (worktree /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-18, HEAD 9042860).
+Command: CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_f65 f65_sync_create_cannot_replace_validated_room_version -- --nocapture > /dev/shm/repro/F65/test1.txt 2>&1
+Output:
+F65 bogus-create batch result: Ok(())
+F65 room_version after bogus create: Some("99")
+F65 since after bogus create: Some("s1")
+F65 redaction batch result: Err(MalformedEvent { room_id: "!room:hs.example.org", event_id: "$red", reason: "cannot resolve m.room.redaction target: room version Some(\"99\") is unknown or unsupported" })
+F65 redaction replay result: Err(MalformedEvent { ... same ... })
+F65 since after redaction attempts: Some("s1")
+panicked at tests/repro_f65.rs:57:5: assertion `left == right` failed: a sync-derived unvalidated create must not replace the validated version
+  left: Some("99")
+ right: Some("11")
+test result: FAILED. 0 passed; 1 failed
+Code: store.rs:1778-1779 accepts any string; store.rs:1824 `room_version = COALESCE(excluded.room_version, rooms.room_version)`. Contrast store.rs:678 set_room_version_control, which keeps the existing value (COALESCE(rooms.room_version, excluded.room_version)). runtime.rs:612 `engine.apply_sync_result(result, now_unix_ms())?`.
+
+Test files: /dev/shm/repro/F65/repro_f65.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-18/tests/repro_f65.rs
+
+## F63 — REPRODUCED (agent severity: low, confidence 0.93)
+
+**Reasoning.** Reproduced end to end through the real MatrixTransport, which goes through matrix-sdk Client::send against the axum loopback mock homeserver, and then through the real Store.
+
+What I verified by running it:
+1. /sync: the mock served a timeline with a 421-byte m.room.message whose content has 130 nested arrays, next to a normal message. The /sync response deserialized fine and transport.sync() returned Ok, but the batch held only ["$ok"]. After apply_sync_batch, $deep is not in `events`, sync_progress.since_token advanced to "s1", and last_error is None. The loss is silent, and the next sync never sees the event again.
+2. /messages: a chunk of [$hist_ok, $hist_deep(130)] came back as a 1-event chunk. apply_history_page returned events_seen=1 with status Some(Advanced), so the cursor moved past the dropped event and nothing records the loss.
+3. Lone surrogate: a ruma Raw<Value> captured from wire text containing "\ud83d" parses fine. serde_json::to_value(&raw), the exact expression at matrix.rs:472, returns Err("unexpected end of hex escape"). raw_event_value turns that error into Value::Null, and select_events drops it because it has no `type`. I checked this at the mechanism level, not end to end, because MockResponse bodies are serde_json::Value and cannot carry a lone surrogate.
+
+What is inferred, not verified: that Synapse accepts, stores and serves such events. Python's json module has a recursion limit of about 1000 and accepts lone-surrogate escapes. Synapse's canonicaljson and event validation may reject the surrogate case, and some non-Synapse servers built on serde_json would reject the deep-nesting case at 128 levels, which limits federation reach. The note that a redaction could be dropped the same way, leaving its target intact, follows from the same code path (select_events treats every event type alike). I did not test it separately.
+
+My severity is low. It is real, silent and permanent data loss that the sender controls, with no counter, log or gap entry. But it needs a deliberately crafted event and a homeserver that accepts it, and the worst outcome is one missing event or redaction, not corruption. Fix: never map a conversion failure to Null. Parse with a RawValue content envelope, or use serde_stacker or disable_recursion_limit, and surface or count anything that still fails.
+
+**Evidence.**
+
+Worktree at the PR head (HEAD = 9042860). Test file: tests/repro_F63.rs, also copied to /dev/shm/repro/F63/repro_F63.rs.
+
+Command:
+cd /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-19 && CARGO_TARGET_DIR=/var/home/sam/src/mainlinenerd/.claude/worktrees/mainlinenerd-pr-review-b196ec/target cargo test --locked --offline --test repro_F63 -- --nocapture --test-threads=1 > /dev/shm/repro/F63/test1.txt 2>&1
+
+Tests:
+- f63_deeply_nested_sync_event_is_not_silently_dropped
+- f63_deeply_nested_history_event_is_not_silently_dropped
+- f63_lone_surrogate_raw_to_value_fails
+
+Key output (/dev/shm/repro/F63/test1.txt, filtered copy in test1f.txt):
+F63 deep event bytes: 421
+F63 sync timeline delivered by MatrixTransport: ["$ok"]
+F63 sync store: $ok=1 $deep=0 since_token=Some("s1") last_error=None
+panicked at tests/repro_F63.rs:129:5: valid, homeserver-served event $deep was silently dropped while the sync token advanced to Some("s1") (last_error=None)  left: 0 right: 1
+F63 history chunk len delivered: 1
+F63 history applied: HistoryApplyOutcome { events_seen: 1, events_duplicate: 0, status: Some(Advanced) }
+F63 history store: $hist_ok=1 $hist_deep=0
+panicked at tests/repro_F63.rs:193:5: valid /messages event $hist_deep was silently dropped while the page applied  left: 0 right: 1
+F63 lone surrogate to_value: Err(Error("unexpected end of hex escape", line: 1, column: 124))
+test result: FAILED. 0 passed; 3 failed; ... EXIT=101
+
+Root cause: src/matrix.rs:471-473 `serde_json::to_value(raw).unwrap_or(Value::Null)`, then matrix.rs:504-506 drops any value without a `type`.
+
+Test files: /dev/shm/repro/F63/repro_F63.rs, /var/home/sam/src/mainlinenerd/.claude/worktrees/wf_c5017115-612-19/tests/repro_F63.rs
+
+---
+
+# Consolidated reproduction branch: `review/pr1-repro-tests`
+
+All 19 reproducers' tests were applied on top of 9042860 (tests/ only; no src/ change) and the whole suite was run once:
+
+```
+test f10_redacting_an_invalid_edit_does_not_project_it ... FAILED
+test f10_valid_edit_targeting_an_invalid_edit_does_not_project_it ... FAILED
+test f15_room_out_of_scope_for_a_run_leaves_a_recorded_gap ... FAILED
+test f17_history_transient_failure_does_not_delay_live_sync ... FAILED
+test f17_sync_transient_backoff_escalates_while_history_succeeds ... FAILED
+test f1_one_malformed_sync_event_must_not_wedge_live_ingest_for_all_rooms ... FAILED
+test f3_invalid_edit_arriving_after_original_redaction_is_suppressed ... FAILED
+test f3_invalid_edit_stored_first_is_suppressed_by_redaction_of_original ... FAILED
+test f41_huge_retry_after_header_is_not_wrapped ... FAILED
+test f41_past_http_date_retry_after_does_not_hot_loop_sync ... FAILED
+test f43_transiently_unready_room_recovers_during_the_run ... FAILED
+test f48_first_run_device_typo_must_not_brick_the_archive_for_the_corrected_config ... FAILED
+test f50_all_alias_outage_keeps_pinned_rooms_configured ... FAILED
+test f50_partial_alias_outage_keeps_pinned_room_in_scope ... FAILED
+test f51_unjoined_world_readable_room_is_not_silently_reported_as_followed ... FAILED
+test f63_deeply_nested_history_event_is_not_silently_dropped ... FAILED
+test f63_deeply_nested_sync_event_is_not_silently_dropped ... FAILED
+test f63_lone_surrogate_raw_to_value_fails ... FAILED
+test f65_sync_create_cannot_replace_validated_room_version ... FAILED
+test f74_encrypted_room_admitted_after_first_sync_is_flagged_and_not_backfilled ... FAILED
+test f74_tombstoned_room_admitted_after_first_sync_is_flagged_and_not_backfilled ... FAILED
+test f9_reply_fallback_does_not_resurrect_redacted_parent_text ... FAILED
+test g1_pre_1_135_synapse_create_event_without_event_id_bootstraps ... FAILED
+test g2_endless_page_without_room_create_is_not_permanently_complete ... FAILED
+test g3_tombstone_does_not_freeze_predecessor_history ... FAILED
+test repro_f16_limited_leave_timeline_records_a_gap ... FAILED
+test repro_f47_alias_drift_is_isolated_to_that_room ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.79s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.05s
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: FAILED. 23 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: FAILED. 72 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+```
+
+Every pre-existing test target still passes (lib 22, adapter 23, cli_live 2, cli 6, config 16, engine 21, runtime 26, store 72). The failing tests are exactly the new reproductions; the F1 and F17 control tests pass, as intended.
+
+Run it yourself (TMPDIR only matters if /tmp is over quota):
+
+```bash
+git fetch origin review/pr1-repro-tests && git checkout review/pr1-repro-tests && TMPDIR=/dev/shm cargo test --locked --offline --no-fail-fast
+```
