@@ -11,13 +11,21 @@ use mainlinenerd_ingest::engine::{
 };
 
 fn engine(transport: FakeTransport, path: &Path) -> Engine<FakeTransport> {
+    engine_with_budget(transport, path, 16)
+}
+
+fn engine_with_budget(
+    transport: FakeTransport,
+    path: &Path,
+    max_pages_per_room: usize,
+) -> Engine<FakeTransport> {
     Engine::new(
         transport,
         open_store(path),
         EngineConfig {
             sync_timeout_ms: 30_000,
             history_limit: 50,
-            max_pages_per_room: 16,
+            max_pages_per_room,
         },
     )
 }
@@ -299,10 +307,14 @@ async fn authentication_history_error_stops_the_run() {
         TransportError::Authentication("401 unauthorized".to_owned()),
     );
     let error = engine.run_history_once(20).await.unwrap_err();
-    assert!(matches!(
-        error,
-        EngineError::Transport(TransportError::Authentication(_))
-    ));
+    match error {
+        EngineError::HistoryAborted { source, partial } => {
+            assert!(matches!(source, TransportError::Authentication(_)));
+            assert_eq!(partial.pages_fetched, 0);
+            assert_eq!(partial.events_stored, 0);
+        }
+        other => panic!("expected an aborted history run, got {other:?}"),
+    }
     assert_eq!(engine.transport().history_call_count(), 1);
 }
 
@@ -417,4 +429,310 @@ async fn history_rate_limit_stops_run_with_retry_hint() {
     assert_eq!(engine.store().rooms_needing_history().unwrap().len(), 2);
     assert!(!engine.store().room_history_stalled(ROOM).unwrap());
     assert!(!engine.store().room_history_stalled(ROOM2).unwrap());
+}
+
+#[tokio::test]
+async fn rate_limit_without_hint_is_still_an_explicit_halt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_two_rooms_ordered(&mut engine).await;
+
+    engine.transport().push_history_error(
+        "pa",
+        TransportError::RateLimited {
+            retry_after_ms: None,
+        },
+    );
+
+    let outcome = engine.run_history_once(30).await.unwrap();
+    assert!(
+        outcome.rate_limited,
+        "a rate limit without a hint must still be classified"
+    );
+    assert_eq!(outcome.retry_after_ms, None);
+    assert_eq!(outcome.items_deferred, 1);
+    assert_eq!(
+        engine.transport().history_call_count(),
+        1,
+        "no later room may be requested after a rate-limited halt"
+    );
+    assert_eq!(engine.store().rooms_needing_history().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn persisted_ledger_detects_a_cycle_across_reopen_with_page_budget_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+
+    {
+        let mut engine = engine_with_budget(FakeTransport::new(), &path, 1);
+        seed_live_room(&mut engine).await;
+        engine
+            .transport()
+            .push_history("p1", history_page("p1", Some("p2"), vec![]));
+        let outcome = engine.run_room_history_once(ROOM, 20).await.unwrap();
+        assert_eq!(outcome.pages_fetched, 1);
+        assert!(!outcome.stalled);
+        assert_eq!(
+            engine.store().room_history_token(ROOM).unwrap().as_deref(),
+            Some("p2")
+        );
+    }
+
+    // Reopen: the visited-token ledger survives, so p2 -> p1 is recognized as
+    // a cycle even though each call only fetched one page.
+    {
+        let mut engine = engine_with_budget(FakeTransport::new(), &path, 1);
+        engine
+            .transport()
+            .push_history("p2", history_page("p2", Some("p1"), vec![]));
+        let outcome = engine.run_room_history_once(ROOM, 30).await.unwrap();
+        assert!(outcome.stalled, "the persisted cycle must stall the base");
+        assert_eq!(outcome.pages_fetched, 1);
+        assert_eq!(engine.transport().history_call_count(), 1);
+        assert!(engine.store().room_history_stalled(ROOM).unwrap());
+        assert_eq!(
+            engine.store().room_history_token(ROOM).unwrap().as_deref(),
+            Some("p2"),
+            "a stalled cycle must not advance the cursor"
+        );
+    }
+}
+
+#[tokio::test]
+async fn longer_cycle_is_detected_by_the_persisted_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_live_room(&mut engine).await;
+
+    // p1 -> p2 -> p3 -> p2: p2 was visited by the first page, so the third
+    // response is a cycle, not a fresh advance.
+    engine
+        .transport()
+        .push_history("p1", history_page("p1", Some("p2"), vec![]));
+    engine
+        .transport()
+        .push_history("p2", history_page("p2", Some("p3"), vec![]));
+    engine
+        .transport()
+        .push_history("p3", history_page("p3", Some("p2"), vec![]));
+
+    let outcome = engine.run_room_history_once(ROOM, 20).await.unwrap();
+    assert!(outcome.stalled);
+    assert_eq!(outcome.pages_fetched, 3);
+    assert_eq!(engine.transport().history_call_count(), 3);
+    assert!(engine.store().room_history_stalled(ROOM).unwrap());
+}
+
+#[tokio::test]
+async fn transient_gap_failure_is_attributed_to_the_gap_not_the_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_live_room(&mut engine).await;
+
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    engine
+        .transport()
+        .push_sync(sync_batch("s2", vec![limited]));
+    engine.poll_sync_once(20).await.unwrap();
+    assert_eq!(engine.store().open_gap_positions().unwrap().len(), 1);
+
+    // The base completes, then the gap request fails transiently.
+    engine.transport().push_history(
+        "p1",
+        history_page("p1", None, vec![message("$old", 50, "old")]),
+    );
+    engine.transport().push_history_error(
+        "p2",
+        TransportError::Transient("connection reset".to_owned()),
+    );
+
+    let outcome = engine.run_history_once(30).await.unwrap();
+    assert_eq!(outcome.rooms_completed, 1);
+    assert_eq!(outcome.items_deferred, 1);
+    assert_eq!(outcome.pages_fetched, 1);
+    assert!(!outcome.rate_limited);
+
+    let report = engine.store().status().unwrap();
+    let room = &report.rooms[0];
+    assert!(
+        !room.history_stalled,
+        "a transient gap failure must not stall the base backfill"
+    );
+    assert_eq!(
+        room.history_error, None,
+        "a transient gap failure must not be written to the base"
+    );
+    assert_eq!(room.open_gaps, 1);
+    assert_eq!(
+        room.open_gap_error.as_deref(),
+        Some("transient transport error: connection reset"),
+        "status attributes the failure to the gap work item"
+    );
+    assert_eq!(
+        engine.store().open_gap_positions().unwrap().len(),
+        1,
+        "the transient gap stays queued"
+    );
+}
+
+#[tokio::test]
+async fn partial_progress_survives_a_transient_failure_after_a_committed_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_live_room(&mut engine).await;
+
+    engine.transport().push_history(
+        "p1",
+        history_page("p1", Some("p2"), vec![message("$h", 50, "h")]),
+    );
+    engine
+        .transport()
+        .push_history_error("p2", TransportError::Transient("blip".to_owned()));
+
+    let outcome = engine.run_history_once(20).await.unwrap();
+    assert_eq!(outcome.pages_fetched, 1);
+    assert_eq!(outcome.events_stored, 1);
+    assert_eq!(outcome.items_deferred, 1);
+    assert!(!outcome.rate_limited);
+    assert_eq!(
+        engine.store().room_history_token(ROOM).unwrap().as_deref(),
+        Some("p2")
+    );
+}
+
+#[tokio::test]
+async fn partial_progress_survives_an_unavailable_failure_after_a_committed_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_live_room(&mut engine).await;
+
+    engine.transport().push_history(
+        "p1",
+        history_page("p1", Some("p2"), vec![message("$h", 50, "h")]),
+    );
+    engine.transport().push_history_error(
+        "p2",
+        TransportError::RoomUnavailable("403 forbidden".to_owned()),
+    );
+
+    let outcome = engine.run_history_once(20).await.unwrap();
+    assert_eq!(outcome.pages_fetched, 1);
+    assert_eq!(outcome.events_stored, 1);
+    assert_eq!(outcome.items_failed, 1);
+    assert!(engine.store().room_history_stalled(ROOM).unwrap());
+}
+
+#[tokio::test]
+async fn partial_progress_survives_a_rate_limit_after_a_committed_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_live_room(&mut engine).await;
+
+    engine.transport().push_history(
+        "p1",
+        history_page("p1", Some("p2"), vec![message("$h", 50, "h")]),
+    );
+    engine.transport().push_history_error(
+        "p2",
+        TransportError::RateLimited {
+            retry_after_ms: None,
+        },
+    );
+
+    let outcome = engine.run_history_once(20).await.unwrap();
+    assert_eq!(outcome.pages_fetched, 1);
+    assert_eq!(outcome.events_stored, 1);
+    assert!(outcome.rate_limited);
+    assert_eq!(outcome.retry_after_ms, None);
+    assert_eq!(outcome.items_deferred, 1);
+}
+
+#[tokio::test]
+async fn partial_progress_is_reported_on_authentication_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut engine = engine(FakeTransport::new(), &path);
+    seed_live_room(&mut engine).await;
+
+    engine.transport().push_history(
+        "p1",
+        history_page("p1", Some("p2"), vec![message("$h", 50, "h")]),
+    );
+    engine.transport().push_history_error(
+        "p2",
+        TransportError::Authentication("401 unauthorized".to_owned()),
+    );
+
+    let error = engine.run_history_once(20).await.unwrap_err();
+    match error {
+        EngineError::HistoryAborted { source, partial } => {
+            assert!(matches!(source, TransportError::Authentication(_)));
+            assert_eq!(partial.pages_fetched, 1);
+            assert_eq!(partial.events_stored, 1);
+            assert_eq!(
+                engine.store().room_history_token(ROOM).unwrap().as_deref(),
+                Some("p2"),
+                "the committed page is durable even when the run aborts"
+            );
+        }
+        other => panic!("expected an aborted history run, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stalled_base_makes_no_requests_even_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+
+    {
+        let mut engine = engine(FakeTransport::new(), &path);
+        seed_live_room(&mut engine).await;
+        engine
+            .transport()
+            .push_history("p1", history_page("p1", Some("p1"), vec![]));
+        let outcome = engine.run_room_history_once(ROOM, 20).await.unwrap();
+        assert!(outcome.stalled);
+        assert_eq!(outcome.pages_fetched, 1);
+        assert_eq!(engine.transport().history_call_count(), 1);
+
+        // A second call on the same engine must not refetch the stalled cursor.
+        let outcome = engine.run_room_history_once(ROOM, 25).await.unwrap();
+        assert!(outcome.stalled);
+        assert_eq!(outcome.pages_fetched, 0);
+        assert_eq!(
+            engine.transport().history_call_count(),
+            1,
+            "a stalled base must not be refetched"
+        );
+    }
+
+    // Reopen: the persisted stall is checked before any network work, so the
+    // old cursor is never refetched and nothing is counted as committed.
+    {
+        let mut engine = engine(FakeTransport::new(), &path);
+        assert!(engine.store().room_history_stalled(ROOM).unwrap());
+        let outcome = engine.run_room_history_once(ROOM, 30).await.unwrap();
+        assert!(outcome.stalled);
+        assert_eq!(outcome.pages_fetched, 0);
+        assert_eq!(outcome.events_stored, 0);
+        assert_eq!(
+            engine.transport().history_call_count(),
+            0,
+            "a persisted stalled base must make zero requests"
+        );
+        assert_eq!(
+            engine.store().room_history_token(ROOM).unwrap().as_deref(),
+            Some("p1")
+        );
+    }
 }

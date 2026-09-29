@@ -16,7 +16,12 @@ use serde_json::{json, Value};
 
 use crate::event::{self, HistoryPage, NormalizedEvent, Source, SyncBatch};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Stall reason for a page whose `end` equals the token it was requested from.
+const REPEATED_TOKEN_REASON: &str = "history pagination returned a repeated token";
+/// Stall reason for a page whose `end` was already visited by that work item.
+const CYCLED_TOKEN_REASON: &str = "history pagination cycled to a previously seen token";
 
 /// The homeserver/account this archive belongs to. Cursors are only reusable
 /// for the same binding; there are no credentials in the store.
@@ -37,6 +42,17 @@ pub enum StoreError {
     Unbound,
     #[error("archive schema version {found} is newer than supported version {supported}")]
     SchemaTooNew { found: i64, supported: i64 },
+    #[error(
+        "archive schema version {found} predates this build (supported version {supported}); \
+         refusing to modify it: keep this archive and point this build at a new database path, \
+         or use a build that supports version {found} to export its contents"
+    )]
+    SchemaTooOld { found: i64, supported: i64 },
+    #[error(
+        "room {room_id} has an m.room.create with a present non-string room_version; \
+         refusing to guess a version and rolling the batch back"
+    )]
+    MalformedRoomVersion { room_id: String },
     #[error("event {event_id} in {room_id} is malformed: {reason}")]
     MalformedEvent {
         room_id: String,
@@ -127,6 +143,15 @@ CREATE TABLE gap_jobs (
 );
 CREATE UNIQUE INDEX gap_jobs_dedupe ON gap_jobs(room_id, upper_token);
 CREATE INDEX gap_jobs_by_status ON gap_jobs(room_id, status);
+
+CREATE TABLE history_visited (
+  room_id TEXT NOT NULL,
+  work_kind TEXT NOT NULL CHECK (work_kind IN ('base', 'gap')),
+  work_id INTEGER NOT NULL DEFAULT 0,
+  token TEXT NOT NULL,
+  visited_at INTEGER NOT NULL,
+  PRIMARY KEY (room_id, work_kind, work_id, token)
+) WITHOUT ROWID;
 
 CREATE TABLE events (
   room_id TEXT NOT NULL,
@@ -235,6 +260,9 @@ pub struct RoomStatus {
     pub history_error: Option<String>,
     pub open_gaps: i64,
     pub unresolved_gaps: i64,
+    /// Last non-terminal error recorded against an open gap repair job, if any.
+    /// Base backfill errors are kept separately in `history_error`.
+    pub open_gap_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -286,48 +314,60 @@ impl Store {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let conn = Self::configure(Connection::open(path)?, false)?;
+        let conn = Self::configure(Connection::open(path)?)?;
         let mut store = Self { conn };
+        // Validate (and, for a fresh file, create) the schema before enabling
+        // durable-write mode, so an unsupported archive is rejected without
+        // even switching its journal mode.
         store.ensure_schema(false)?;
+        // FULL keeps the documented guarantee that a committed batch/page
+        // survives a crash; WAL with NORMAL may lose acknowledged commits on
+        // power loss.
+        store
+            .conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         store.ensure_binding(identity)?;
         Ok(store)
     }
 
     /// Open an existing archive read-only (status/export).
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let conn = Self::configure(
-            Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?,
-            true,
-        )?;
+        let conn = Self::configure(Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?)?;
         let mut store = Self { conn };
         store.ensure_schema(true)?;
         store.require_binding()?;
         Ok(store)
     }
 
-    fn configure(conn: Connection, read_only: bool) -> Result<Connection, StoreError> {
+    fn configure(conn: Connection) -> Result<Connection, StoreError> {
         conn.busy_timeout(Duration::from_secs(5))?;
-        if !read_only {
-            // FULL keeps the documented guarantee that a committed batch/page
-            // survives a crash; WAL with NORMAL may lose acknowledged commits
-            // on power loss.
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-        }
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(conn)
     }
 
     /// Create the schema and its version in one transaction, so a late DDL
     /// failure cannot strand a half-initialized archive.
+    ///
+    /// An existing nonzero `user_version` that is not [`SCHEMA_VERSION`] is
+    /// rejected before any DDL or DML runs, in both writable and read-only
+    /// opens. Older archives are never reset or migrated in place: the schema
+    /// is read from `PRAGMA user_version` alone, so even an old layout missing
+    /// a later column is recognized and left untouched.
     fn ensure_schema(&mut self, read_only: bool) -> Result<(), StoreError> {
         let found: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if found > SCHEMA_VERSION {
             return Err(StoreError::SchemaTooNew {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if found != 0 && found < SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooOld {
                 found,
                 supported: SCHEMA_VERSION,
             });
@@ -480,10 +520,19 @@ impl Store {
 
     /// Commit one `/messages` page and update exactly the durable cursor the
     /// page was requested for: the room's base backfill cursor or one bounded
-    /// gap repair job. `expected_from` must still match that cursor at
-    /// application time; a late in-flight page whose cursor has moved is
-    /// reported as [`HistoryStatus::Stale`] and changes nothing. Exhaustion,
-    /// stalls and completion of one work item never close another.
+    /// gap repair job. `expected_from` must still match that work item's own
+    /// cursor and the work item must still be eligible (a base that is not
+    /// complete or stalled; a gap that is still open); otherwise the response
+    /// is [`HistoryStatus::Stale`] and changes nothing, so a late in-flight
+    /// page can never overwrite newer progress. Exhaustion, stalls and
+    /// completion of one work item never close another.
+    ///
+    /// Successful page tokens are persisted per work item in the same
+    /// transaction that applies the page. A returned `end` already visited by
+    /// this work item is a cycle: it stalls (base) or unresolves (gap) the work
+    /// item instead of advancing, even across calls and process restarts. A
+    /// malformed page rolls the ledger back with the events and cursor, and a
+    /// stale page never touches it.
     pub fn apply_history_page(
         &mut self,
         room_id: &str,
@@ -500,17 +549,18 @@ impl Store {
         }
 
         // Validate the work item before storing anything, so a stale response
-        // cannot touch events or cursor state.
+        // cannot touch events, cursors or visited tokens.
         let target = match work {
-            HistoryWork::Base => {
-                if history_token(&tx, room_id)?.as_deref() != Some(expected_from) {
-                    return Ok(HistoryApplyOutcome {
-                        status: Some(HistoryStatus::Stale),
-                        ..Default::default()
-                    });
+            HistoryWork::Base => match base_state(&tx, room_id)? {
+                Some(state)
+                    if !state.complete
+                        && !state.stalled
+                        && state.token.as_deref() == Some(expected_from) =>
+                {
+                    AppliedWork::Base
                 }
-                AppliedWork::Base
-            }
+                _ => return Ok(stale_outcome()),
+            },
             HistoryWork::Gap(gap_id) => match gap_row(&tx, gap_id)? {
                 Some(gap)
                     if gap.room_id == room_id
@@ -522,14 +572,10 @@ impl Store {
                         boundary: gap.boundary_token,
                     }
                 }
-                _ => {
-                    return Ok(HistoryApplyOutcome {
-                        status: Some(HistoryStatus::Stale),
-                        ..Default::default()
-                    });
-                }
+                _ => return Ok(stale_outcome()),
             },
         };
+        let (work_kind, work_id) = ledger_key(work);
 
         let room_version = room_version(&tx, room_id)?;
         let mut outcome = HistoryApplyOutcome::default();
@@ -548,53 +594,67 @@ impl Store {
         }
 
         let repeated = page.end.as_deref() == Some(expected_from);
-        match (&target, &page.end, repeated) {
-            (AppliedWork::Base, _, true) => {
-                mark_base_stalled(
-                    &tx,
-                    room_id,
-                    "history pagination returned a repeated token",
-                    received_at,
-                )?;
+        let cycled = match page.end.as_deref() {
+            Some(end) if !repeated => token_visited(&tx, room_id, work_kind, work_id, end)?,
+            _ => false,
+        };
+        match (&target, &page.end, repeated, cycled) {
+            (AppliedWork::Base, _, true, _) => {
+                mark_base_stalled(&tx, room_id, REPEATED_TOKEN_REASON, received_at)?;
                 outcome.status = Some(HistoryStatus::Stalled);
             }
-            (AppliedWork::Base, None, _) => {
+            (AppliedWork::Base, _, _, true) => {
+                mark_base_stalled(&tx, room_id, CYCLED_TOKEN_REASON, received_at)?;
+                outcome.status = Some(HistoryStatus::Stalled);
+            }
+            (AppliedWork::Base, None, _, _) => {
                 tx.execute(
                     "UPDATE room_history SET token = NULL, complete = 1, stalled = 0, pages = pages + 1, last_error = NULL, updated_at = ?2 WHERE room_id = ?1",
                     params![room_id, received_at],
                 )?;
+                clear_visited(&tx, room_id, work_kind, work_id)?;
                 outcome.status = Some(HistoryStatus::Completed);
             }
-            (AppliedWork::Base, Some(end), _) => {
+            (AppliedWork::Base, Some(end), _, _) => {
+                record_visited(&tx, room_id, work_kind, work_id, expected_from, received_at)?;
+                record_visited(&tx, room_id, work_kind, work_id, end, received_at)?;
                 tx.execute(
                     "UPDATE room_history SET token = ?2, complete = 0, stalled = 0, pages = pages + 1, last_error = NULL, updated_at = ?3 WHERE room_id = ?1",
                     params![room_id, end, received_at],
                 )?;
                 outcome.status = Some(HistoryStatus::Advanced);
             }
-            (AppliedWork::Gap { gap_id, .. }, _, true) => {
+            (AppliedWork::Gap { gap_id, .. }, _, true, _) => {
                 close_gap(
                     &tx,
                     *gap_id,
                     "unresolved",
-                    "history pagination returned a repeated token",
+                    REPEATED_TOKEN_REASON,
                     received_at,
                 )?;
                 outcome.status = Some(HistoryStatus::Stalled);
             }
-            (AppliedWork::Gap { gap_id, .. }, None, _) => {
+            (AppliedWork::Gap { gap_id, .. }, _, _, true) => {
+                close_gap(&tx, *gap_id, "unresolved", CYCLED_TOKEN_REASON, received_at)?;
+                outcome.status = Some(HistoryStatus::Stalled);
+            }
+            (AppliedWork::Gap { gap_id, .. }, None, _, _) => {
                 close_gap(&tx, *gap_id, "repaired", "history_start", received_at)?;
+                clear_visited(&tx, room_id, work_kind, work_id)?;
                 outcome.status = Some(HistoryStatus::Completed);
             }
-            (AppliedWork::Gap { gap_id, boundary }, Some(end), _)
+            (AppliedWork::Gap { gap_id, boundary }, Some(end), _, _)
                 if boundary.as_deref() == Some(end.as_str()) =>
             {
                 close_gap(&tx, *gap_id, "repaired", "token", received_at)?;
+                clear_visited(&tx, room_id, work_kind, work_id)?;
                 outcome.status = Some(HistoryStatus::Completed);
             }
-            (AppliedWork::Gap { gap_id, .. }, Some(end), _) => {
+            (AppliedWork::Gap { gap_id, .. }, Some(end), _, _) => {
+                record_visited(&tx, room_id, work_kind, work_id, expected_from, received_at)?;
+                record_visited(&tx, room_id, work_kind, work_id, end, received_at)?;
                 tx.execute(
-                    "UPDATE gap_jobs SET cursor_token = ?2 WHERE gap_id = ?1",
+                    "UPDATE gap_jobs SET cursor_token = ?2, close_reason = NULL WHERE gap_id = ?1",
                     params![gap_id, end],
                 )?;
                 outcome.status = Some(HistoryStatus::Advanced);
@@ -626,6 +686,17 @@ impl Store {
         self.conn.execute(
             "UPDATE room_history SET last_error = ?2, updated_at = ?3 WHERE room_id = ?1",
             params![room_id, error, at],
+        )?;
+        Ok(())
+    }
+
+    /// Record a non-terminal error against one open gap repair job, leaving it
+    /// open and queued for a later run. The room's base backfill row is never
+    /// touched, so `status` attributes the failure to the actual work item.
+    pub fn record_gap_error(&self, gap_id: i64, error: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE gap_jobs SET close_reason = ?2 WHERE gap_id = ?1 AND status = 'open'",
+            params![gap_id, error],
         )?;
         Ok(())
     }
@@ -748,7 +819,10 @@ impl Store {
                     (SELECT COUNT(*) FROM current_messages m WHERE m.room_id = r.room_id),
                     h.token IS NOT NULL, h.complete, h.stalled, h.pages, h.last_error,
                     (SELECT COUNT(*) FROM gap_jobs g WHERE g.room_id = r.room_id AND g.status = 'open'),
-                    (SELECT COUNT(*) FROM gap_jobs g WHERE g.room_id = r.room_id AND g.status = 'unresolved')
+                    (SELECT COUNT(*) FROM gap_jobs g WHERE g.room_id = r.room_id AND g.status = 'unresolved'),
+                    (SELECT g.close_reason FROM gap_jobs g
+                       WHERE g.room_id = r.room_id AND g.status = 'open' AND g.close_reason IS NOT NULL
+                       ORDER BY g.gap_id DESC LIMIT 1)
              FROM rooms r LEFT JOIN room_history h ON h.room_id = r.room_id
              ORDER BY r.room_id",
         )?;
@@ -769,6 +843,7 @@ impl Store {
                 history_error: row.get(12)?,
                 open_gaps: row.get(13)?,
                 unresolved_gaps: row.get(14)?,
+                open_gap_error: row.get(15)?,
             })
         })?;
         let mut rooms = Vec::new();
@@ -915,7 +990,7 @@ impl Store {
             }
             let _ = writeln!(
                 out,
-                "room {} v{} events={} messages={} history={} pages={} gaps(open={},unresolved={}){}",
+                "room {} v{} events={} messages={} history={} pages={} gaps(open={},unresolved={}{}){}",
                 room.room_id,
                 room.room_version.as_deref().unwrap_or("?"),
                 room.events,
@@ -932,6 +1007,10 @@ impl Store {
                 room.history_pages,
                 room.open_gaps,
                 room.unresolved_gaps,
+                room.open_gap_error
+                    .as_deref()
+                    .map(|error| format!(",error={error}"))
+                    .unwrap_or_default(),
                 if flags.is_empty() {
                     String::new()
                 } else {
@@ -1109,8 +1188,22 @@ fn apply_sync_room(
         match event_type {
             event::ROOM_CREATE => {
                 if let Some(content) = obj.get("content").and_then(Value::as_object) {
-                    if let Some(version) = content.get("room_version").and_then(Value::as_str) {
-                        room_version = Some(version.to_owned());
+                    match content.get("room_version") {
+                        // Per the spec an `m.room.create` without a room
+                        // version is room version 1. A present but non-string
+                        // value is malformed, never coerced into a string that
+                        // might accidentally name a recognized version.
+                        None => {
+                            room_version = room_version.or_else(|| Some("1".to_owned()));
+                        }
+                        Some(version) => match version.as_str() {
+                            Some(version) => room_version = Some(version.to_owned()),
+                            None => {
+                                return Err(StoreError::MalformedRoomVersion {
+                                    room_id: room.room_id.clone(),
+                                });
+                            }
+                        },
                     }
                     predecessor_room_id = content
                         .get("predecessor")
@@ -1183,31 +1276,15 @@ fn apply_sync_room(
         }
     }
 
-    let has_history = conn
-        .query_row(
-            "SELECT 1 FROM room_history WHERE room_id = ?1",
-            params![room.room_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some();
-
     if room.limited {
         match previous_since {
             // The first sync has no previous committed token: it is the start
             // of archival backfill, not a missing-live interval.
             None => {
-                if !has_history {
-                    insert_room_history(
-                        conn,
-                        &room.room_id,
-                        room.prev_batch.as_deref(),
-                        received_at,
-                    )?;
-                }
+                seed_room_history(conn, &room.room_id, room.prev_batch.as_deref(), received_at)?;
             }
             Some(boundary) => match room.prev_batch.as_deref() {
-                Some(upper) => {
+                Some(upper) if upper != boundary => {
                     let inserted = conn.execute(
                         "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status)
                          VALUES (?1, ?2, 'limited_sync', ?3, ?4, ?4, 'open')
@@ -1215,12 +1292,16 @@ fn apply_sync_room(
                         params![room.room_id, received_at, boundary, upper],
                     )?;
                     outcome.gaps_opened += inserted as u64;
-                    if !has_history {
-                        // Base backfill still starts at this timeline's
-                        // prev_batch; the gap job only repairs the bounded
-                        // live interval, it does not own the room cursor.
-                        insert_room_history(conn, &room.room_id, Some(upper), received_at)?;
-                    }
+                    // Base backfill still starts at this timeline's
+                    // prev_batch; the gap job only repairs the bounded live
+                    // interval, it does not own the room cursor.
+                    seed_room_history(conn, &room.room_id, Some(upper), received_at)?;
+                }
+                Some(upper) => {
+                    // `prev_batch` equals the last committed global token: the
+                    // interval has no span, so there is no gap to repair. Base
+                    // backfill is still seeded if it never started.
+                    seed_room_history(conn, &room.room_id, Some(upper), received_at)?;
                 }
                 None => {
                     // No repair token: record the gap as unresolved rather
@@ -1231,22 +1312,26 @@ fn apply_sync_room(
                         params![room.room_id, received_at, boundary],
                     )?;
                     outcome.gaps_opened += 1;
-                    if !has_history {
-                        insert_room_history(conn, &room.room_id, None, received_at)?;
-                    }
+                    seed_room_history(conn, &room.room_id, None, received_at)?;
                 }
             },
         }
-    } else if !has_history {
-        insert_room_history(conn, &room.room_id, room.prev_batch.as_deref(), received_at)?;
+    } else {
+        seed_room_history(conn, &room.room_id, room.prev_batch.as_deref(), received_at)?;
     }
 
     Ok(())
 }
 
-/// Seed a room's base backfill cursor. Never rewinds or resets an existing
-/// row: a live batch must not clobber in-progress archival backfill.
-fn insert_room_history(
+/// Seed a room's base backfill cursor.
+///
+/// A missing row is inserted with `token` (which may be absent, leaving the
+/// room honestly unseeded). An existing row is only ever moved from the
+/// never-started empty state: no token, no pages, not complete and not
+/// stalled. A later explicit `prev_batch` may therefore seed such a row, but
+/// in-progress, completed and stalled backfill is never rewound or reset, and
+/// the absence of a token is never treated as completion.
+fn seed_room_history(
     conn: &Connection,
     room_id: &str,
     token: Option<&str>,
@@ -1255,7 +1340,14 @@ fn insert_room_history(
     conn.execute(
         "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
          VALUES (?1, ?2, 0, 0, 0, ?3)
-         ON CONFLICT(room_id) DO NOTHING",
+         ON CONFLICT(room_id) DO UPDATE SET
+           token = excluded.token,
+           updated_at = excluded.updated_at
+         WHERE room_history.token IS NULL
+           AND room_history.pages = 0
+           AND room_history.complete = 0
+           AND room_history.stalled = 0
+           AND excluded.token IS NOT NULL",
         params![room_id, token, at],
     )?;
     Ok(())
@@ -1730,6 +1822,94 @@ enum AppliedWork {
         gap_id: i64,
         boundary: Option<String>,
     },
+}
+
+/// Nothing applied: a late page whose work item no longer expects this token.
+fn stale_outcome() -> HistoryApplyOutcome {
+    HistoryApplyOutcome {
+        status: Some(HistoryStatus::Stale),
+        ..Default::default()
+    }
+}
+
+/// Durable state of a room's base backfill, used to validate eligibility.
+struct BaseState {
+    token: Option<String>,
+    complete: bool,
+    stalled: bool,
+}
+
+fn base_state(conn: &Connection, room_id: &str) -> Result<Option<BaseState>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT token, complete, stalled FROM room_history WHERE room_id = ?1",
+            params![room_id],
+            |row| {
+                Ok(BaseState {
+                    token: row.get(0)?,
+                    complete: row.get(1)?,
+                    stalled: row.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The `history_visited` ledger key of a work item: base backfill uses work id
+/// 0; each gap repair job uses its own `gap_id`. Ledgers never overlap, so a
+/// cycle in one work item cannot stall another.
+fn ledger_key(work: HistoryWork) -> (&'static str, i64) {
+    match work {
+        HistoryWork::Base => ("base", 0),
+        HistoryWork::Gap(gap_id) => ("gap", gap_id),
+    }
+}
+
+fn token_visited(
+    conn: &Connection,
+    room_id: &str,
+    work_kind: &str,
+    work_id: i64,
+    token: &str,
+) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM history_visited
+             WHERE room_id = ?1 AND work_kind = ?2 AND work_id = ?3 AND token = ?4",
+            params![room_id, work_kind, work_id, token],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn record_visited(
+    conn: &Connection,
+    room_id: &str,
+    work_kind: &str,
+    work_id: i64,
+    token: &str,
+    at: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO history_visited (room_id, work_kind, work_id, token, visited_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![room_id, work_kind, work_id, token, at],
+    )?;
+    Ok(())
+}
+
+fn clear_visited(
+    conn: &Connection,
+    room_id: &str,
+    work_kind: &str,
+    work_id: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM history_visited WHERE room_id = ?1 AND work_kind = ?2 AND work_id = ?3",
+        params![room_id, work_kind, work_id],
+    )?;
+    Ok(())
 }
 
 struct GapRow {

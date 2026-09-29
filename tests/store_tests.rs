@@ -1557,7 +1557,7 @@ fn edit_arriving_after_original_redaction_is_suppressed() {
         assert_eq!(
             scalar_string(
                 &conn,
-                "SELECT raw_json FROM events WHERE event_id = '$orig'"
+                "SELECT raw_json FROM events WHERE event_id = '$edit'"
             )
             .map(|raw| raw.contains("late secret")),
             Some(false)
@@ -2836,4 +2836,918 @@ fn redacted_bundle_row_stays_suppressed_when_the_fetched_event_arrives() {
     let text = String::from_utf8(events).unwrap();
     assert!(!text.contains("fetched secret"));
     assert!(!text.contains("bundle secret"));
+}
+
+// ---------------------------------------------------------------------------
+// Schema compatibility
+// ---------------------------------------------------------------------------
+
+#[test]
+fn old_schema_without_cursor_token_is_rejected_and_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    {
+        // The baseline v1 shape: no `gap_jobs.cursor_token` and no durable
+        // visited-token ledger.
+        let conn = db(&path);
+        conn.execute_batch(
+            "CREATE TABLE archive_meta (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 homeserver TEXT NOT NULL,
+                 user_id TEXT NOT NULL,
+                 device_id TEXT NOT NULL,
+                 bound_at INTEGER NOT NULL
+             );
+             INSERT INTO archive_meta VALUES
+                 (1, 'https://hs.example.org', '@ingest:hs.example.org', 'MLN', 7);
+             CREATE TABLE gap_jobs (
+                 gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 room_id TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 reason TEXT NOT NULL,
+                 boundary_token TEXT,
+                 upper_token TEXT,
+                 status TEXT NOT NULL DEFAULT 'open'
+             );
+             INSERT INTO gap_jobs (room_id, created_at, reason)
+                 VALUES ('!room:hs.example.org', 1, 'legacy');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        assert_eq!(
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('gap_jobs') WHERE name = 'cursor_token'"
+            ),
+            0,
+            "the baseline v1 shape really lacks gap_jobs.cursor_token"
+        );
+    }
+
+    let writable = mainlinenerd_ingest::store::Store::open(&path, &identity())
+        .err()
+        .expect("open must be rejected");
+    let advice = writable.to_string();
+    assert!(
+        advice.contains("new database path") && advice.contains("export"),
+        "the error must preserve the archive and suggest a new path or an older build: {advice}"
+    );
+    assert!(
+        !advice.to_lowercase().contains("delete"),
+        "the error must not advise deletion: {advice}"
+    );
+    assert!(matches!(
+        writable,
+        StoreError::SchemaTooOld {
+            found: 1,
+            supported: 2
+        }
+    ));
+    let read_only = mainlinenerd_ingest::store::Store::open_read_only(&path)
+        .err()
+        .expect("read-only open must be rejected");
+    assert!(matches!(
+        read_only,
+        StoreError::SchemaTooOld {
+            found: 1,
+            supported: 2
+        }
+    ));
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(&conn, "PRAGMA user_version"),
+        1,
+        "rejection must not rewrite the schema version"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM gap_jobs"), 1);
+    assert_eq!(
+        scalar_string(&conn, "SELECT reason FROM gap_jobs"),
+        Some("legacy".to_owned())
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history_visited'"
+        ),
+        0,
+        "no part of the new schema may be created on rejection"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM pragma_table_info('gap_jobs') WHERE name = 'cursor_token'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn newer_schema_version_is_rejected_in_both_open_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    {
+        let conn = db(&path);
+        conn.execute_batch("CREATE TABLE sentinel (x INTEGER); PRAGMA user_version = 3;")
+            .unwrap();
+    }
+
+    let writable = mainlinenerd_ingest::store::Store::open(&path, &identity())
+        .err()
+        .expect("open must be rejected");
+    assert!(matches!(
+        writable,
+        StoreError::SchemaTooNew {
+            found: 3,
+            supported: 2
+        }
+    ));
+    let read_only = mainlinenerd_ingest::store::Store::open_read_only(&path)
+        .err()
+        .expect("read-only open must be rejected");
+    assert!(matches!(
+        read_only,
+        StoreError::SchemaTooNew {
+            found: 3,
+            supported: 2
+        }
+    ));
+
+    let conn = db(&path);
+    assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 3);
+}
+
+#[test]
+fn fresh_archive_records_schema_version_two_and_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let store = open_store(&path);
+    assert_eq!(store.status().unwrap().schema_version, 2);
+    drop(store);
+
+    let conn = db(&path);
+    assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 2);
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history_visited'"
+        ),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Room-version-dependent redaction target
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pre_v11_redaction_uses_only_the_top_level_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        create_room("10"),
+        message("$a", 100, "a body"),
+        message("$b", 110, "b body"),
+        // content.redacts is not a target before v11 and must delete nothing.
+        json!({
+            "type": "m.room.redaction", "event_id": "$wrong-field", "sender": ALICE,
+            "origin_server_ts": 200,
+            "content": { "redacts": "$a" }
+        }),
+        json!({
+            "type": "m.room.redaction", "event_id": "$right-field", "sender": ALICE,
+            "origin_server_ts": 210,
+            "redacts": "$b",
+            "content": {}
+        }),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT body FROM current_messages WHERE event_id = '$a'"
+        ),
+        Some("a body".to_owned()),
+        "the pre-v11 wrong field must not delete the other target"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM redactions WHERE redaction_event_id = '$wrong-field'"
+        ),
+        0,
+        "a wrong-field-only redaction records no deletion"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT redacted FROM current_messages WHERE event_id = '$b'"
+        ),
+        1,
+        "the pre-v11 top-level field deletes"
+    );
+}
+
+#[test]
+fn v11_redaction_uses_content_and_conflicts_leave_the_other_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        create_room("11"),
+        message("$c", 100, "c body"),
+        message("$d", 110, "d body"),
+        // Conflicting fields: v11's authoritative `content.redacts` wins and
+        // the top-level field must not delete its target.
+        json!({
+            "type": "m.room.redaction", "event_id": "$conflict", "sender": ALICE,
+            "origin_server_ts": 200,
+            "redacts": "$d",
+            "content": { "redacts": "$c" }
+        }),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT redacted FROM current_messages WHERE event_id = '$c'"
+        ),
+        1,
+        "v11 content.redacts is authoritative"
+    );
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT body FROM current_messages WHERE event_id = '$d'"
+        ),
+        Some("d body".to_owned()),
+        "the conflicting top-level field must not delete the other target"
+    );
+}
+
+#[test]
+fn wrong_field_only_v11_redaction_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        create_room("11"),
+        message("$m", 100, "secret"),
+        json!({
+            "type": "m.room.redaction", "event_id": "$red", "sender": ALICE,
+            "origin_server_ts": 200,
+            "redacts": "$m",
+            "content": {}
+        }),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT body FROM current_messages WHERE event_id = '$m'"
+        ),
+        Some("secret".to_owned())
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM redactions WHERE redaction_event_id = '$red'"
+        ),
+        0,
+        "a wrong-field-only redaction records no deletion"
+    );
+}
+
+#[test]
+fn versionless_create_defaults_to_v1_for_redaction_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        json!({
+            "type": "m.room.create", "event_id": "$create", "sender": ALICE,
+            "state_key": "", "origin_server_ts": 1,
+            "content": { "creator": ALICE }
+        }),
+        message("$m", 100, "secret"),
+        json!({
+            "type": "m.room.redaction", "event_id": "$red", "sender": ALICE,
+            "origin_server_ts": 200,
+            "redacts": "$m",
+            "content": {}
+        }),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT redacted FROM current_messages WHERE event_id = '$m'"
+        ),
+        1,
+        "an absent room_version behaves as v1, where top-level redacts applies"
+    );
+    assert_eq!(
+        store.status().unwrap().rooms[0].room_version.as_deref(),
+        Some("1")
+    );
+}
+
+#[test]
+fn versionless_create_ignores_content_redacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        json!({
+            "type": "m.room.create", "event_id": "$create", "sender": ALICE,
+            "state_key": "", "origin_server_ts": 1,
+            "content": { "creator": ALICE }
+        }),
+        message("$m", 100, "secret"),
+        json!({
+            "type": "m.room.redaction", "event_id": "$red", "sender": ALICE,
+            "origin_server_ts": 200,
+            "content": { "redacts": "$m" }
+        }),
+    ];
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT body FROM current_messages WHERE event_id = '$m'"
+        ),
+        Some("secret".to_owned()),
+        "v1 rules ignore content.redacts"
+    );
+}
+
+#[test]
+fn present_non_string_create_version_is_malformed_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    // A committed checkpoint proves the failing batches cannot move it.
+    let mut seed = room_update(ROOM2);
+    seed.timeline = vec![message("$seed", 50, "seed")];
+    seed.prev_batch = Some("p0".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s0", vec![seed]), 5)
+        .unwrap();
+
+    // Every present non-string value is invalid; none may be coerced into a
+    // recognized version such as "1" or "11".
+    for version in [
+        json!(1),
+        json!(11),
+        json!(null),
+        json!(true),
+        json!({ "payload": "PRIVATE_FIELD_MARKER" }),
+        json!([]),
+    ] {
+        let mut room = room_update(ROOM);
+        room.timeline = vec![
+            json!({
+                "type": "m.room.create", "event_id": "$create", "sender": ALICE,
+                "state_key": "", "origin_server_ts": 1,
+                "content": { "creator": ALICE, "room_version": version }
+            }),
+            message("$m", 100, "secret"),
+            json!({
+                "type": "m.room.redaction", "event_id": "$red", "sender": ALICE,
+                "origin_server_ts": 200,
+                "content": { "redacts": "$m" }
+            }),
+        ];
+        let error = store
+            .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::MalformedRoomVersion { .. }),
+            "version {version} must be rejected: {error}"
+        );
+        assert!(!error.to_string().contains("PRIVATE_FIELD_MARKER"));
+        assert!(!format!("{error:?}").contains("PRIVATE_FIELD_MARKER"));
+        assert_eq!(
+            store.since_token().unwrap().as_deref(),
+            Some("s0"),
+            "version {version} must not advance the checkpoint"
+        );
+        assert_eq!(
+            store.room_history_token(ROOM).unwrap(),
+            None,
+            "version {version} must not seed history"
+        );
+    }
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+        1,
+        "only the committed seed event survives"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM rooms"), 1);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM redactions"),
+        0,
+        "no rejected redaction may delete a target"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM room_history"), 1);
+}
+
+#[test]
+fn redaction_without_a_known_room_version_rolls_back_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut seed = room_update(ROOM2);
+    seed.timeline = vec![message("$seed", 50, "seed")];
+    seed.prev_batch = Some("p0".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s0", vec![seed]), 5)
+        .unwrap();
+    assert_eq!(store.since_token().unwrap().as_deref(), Some("s0"));
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![
+        message("$m", 100, "secret"),
+        json!({
+            "type": "m.room.redaction", "event_id": "$red", "sender": ALICE,
+            "origin_server_ts": 200,
+            "content": { "redacts": "$m" }
+        }),
+    ];
+    let error = store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 20)
+        .unwrap_err();
+    assert!(matches!(error, StoreError::MalformedEvent { .. }));
+
+    assert_eq!(
+        store.since_token().unwrap().as_deref(),
+        Some("s0"),
+        "the checkpoint must not advance"
+    );
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+        1,
+        "the whole batch rolls back"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM rooms"), 1);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM gap_jobs"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Durable visited-token ledger
+// ---------------------------------------------------------------------------
+
+#[test]
+fn malformed_or_stale_pages_do_not_poison_the_visited_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![message("$live", 100, "live")];
+    room.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    let error = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page(
+                "p1",
+                Some("p2"),
+                vec![message("$ok", 50, "ok"), json!({"type": "m.room.message"})],
+            ),
+            20,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::MalformedEvent { .. }));
+    {
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM history_visited"),
+            0,
+            "a rolled-back page must not record visited tokens"
+        );
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM events"), 1);
+    }
+
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "wrong",
+            &history_page("wrong", Some("q"), vec![]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stale));
+    {
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM history_visited"),
+            0,
+            "a stale page must not record visited tokens"
+        );
+    }
+
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("p2"), vec![]),
+            40,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    {
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM history_visited"),
+            2,
+            "a committed page records its requested and returned tokens"
+        );
+    }
+
+    // The recorded p1 now makes p2 -> p1 a cycle within the same call.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p2",
+            &history_page("p2", Some("p1"), vec![]),
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
+}
+
+#[test]
+fn visited_ledger_is_independent_per_work_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p0".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+    for (next_batch, prev_batch, at) in [("s2", "p1", 20), ("s3", "p2", 30)] {
+        let mut limited = room_update(ROOM);
+        limited.timeline = vec![message(&format!("$live-{prev_batch}"), 300, "live")];
+        limited.prev_batch = Some(prev_batch.to_owned());
+        limited.limited = true;
+        store
+            .apply_sync_batch(&sync_batch(next_batch, vec![limited]), at)
+            .unwrap();
+    }
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 2);
+    let gap_one = gaps[0].gap_id;
+    let gap_two = gaps[1].gap_id;
+
+    // Gap one cycles through a token it has already visited.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_one),
+            "p1",
+            &history_page("p1", Some("x"), vec![]),
+            40,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_one),
+            "x",
+            &history_page("x", Some("p1"), vec![]),
+            41,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
+
+    // Gap two walks through the same token strings; gap one's ledger must not
+    // block it, so it reaches p1.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_two),
+            "p2",
+            &history_page("p2", Some("x"), vec![]),
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_two),
+            "x",
+            &history_page("x", Some("p1"), vec![]),
+            51,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    assert_eq!(
+        store.open_gap_position(gap_two).unwrap().unwrap().token,
+        "p1"
+    );
+
+    // The base backfill is untouched.
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p0")
+    );
+    assert!(!store.room_history_stalled(ROOM).unwrap());
+    let report = store.status().unwrap();
+    assert_eq!(report.rooms[0].open_gaps, 1);
+    assert_eq!(report.rooms[0].unresolved_gaps, 1);
+}
+
+#[test]
+fn ineligible_work_items_refuse_late_in_flight_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut room = room_update(ROOM);
+    room.timeline = vec![message("$live", 100, "live")];
+    room.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .unwrap();
+
+    // Stall the base; its token stays p1, so a late p1 page still matches the
+    // token and must be refused on eligibility alone.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("p1"), vec![]),
+            20,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
+    let events_before = {
+        let conn = db(&path);
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events")
+    };
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("p2"), vec![message("$late", 5, "late")]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.status,
+        Some(HistoryStatus::Stale),
+        "a stalled base must refuse its old in-flight page"
+    );
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+    {
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+            events_before
+        );
+    }
+
+    // A completed base refuses a late page too.
+    let mut done = room_update(ROOM2);
+    done.timeline = vec![message("$live", 100, "live")];
+    done.prev_batch = Some("p9".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![done]), 40)
+        .unwrap();
+    let outcome = store
+        .apply_history_page(
+            ROOM2,
+            HistoryWork::Base,
+            "p9",
+            &history_page("p9", None, vec![]),
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+    let outcome = store
+        .apply_history_page(
+            ROOM2,
+            HistoryWork::Base,
+            "p9",
+            &history_page("p9", Some("p10"), vec![message("$late2", 5, "late")]),
+            60,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stale));
+
+    // A closed (unresolved) gap refuses a late page as well.
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s3", vec![limited]), 70)
+        .unwrap();
+    let gap_id = store.open_gap_positions().unwrap()[0].gap_id;
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
+            &history_page("p2", Some("p2"), vec![]),
+            80,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
+            &history_page("p2", Some("p3"), vec![message("$late3", 5, "late")]),
+            90,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stale));
+}
+
+// ---------------------------------------------------------------------------
+// Limited-sync span and unseeded base rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn limited_sync_with_no_span_neither_opens_a_gap_nor_rewinds_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut first = room_update(ROOM);
+    first.timeline = vec![message("$live", 100, "live")];
+    first.prev_batch = Some("p0".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![first]), 10)
+        .unwrap();
+
+    // prev_batch equals the last committed token: no missing span, no gap.
+    let mut equal = room_update(ROOM);
+    equal.timeline = vec![message("$live2", 300, "live2")];
+    equal.prev_batch = Some("s1".to_owned());
+    equal.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![equal]), 20)
+        .unwrap();
+    assert!(
+        store.open_gap_positions().unwrap().is_empty(),
+        "an interval with no span must not open a gap job"
+    );
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p0"),
+        "the existing base backfill must not be rewound"
+    );
+
+    // A new room whose first appearance is an equal-span limited sync still
+    // gets its base history seeded.
+    let mut new_room = room_update(ROOM3);
+    new_room.timeline = vec![message("$new", 400, "new")];
+    new_room.prev_batch = Some("s2".to_owned());
+    new_room.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s3", vec![new_room]), 30)
+        .unwrap();
+    assert!(store.open_gap_positions().unwrap().is_empty());
+    assert_eq!(
+        store.room_history_token(ROOM3).unwrap().as_deref(),
+        Some("s2")
+    );
+    assert!(!store.room_history_complete(ROOM3).unwrap());
+}
+
+#[test]
+fn a_never_started_base_row_adopts_a_later_prev_batch_and_never_rewinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    // A sync with no prev_batch leaves the base honestly unseeded.
+    let mut no_token = room_update(ROOM);
+    no_token.timeline = vec![message("$live", 100, "live")];
+    no_token.prev_batch = None;
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![no_token]), 10)
+        .unwrap();
+    assert_eq!(store.room_history_token(ROOM).unwrap(), None);
+    assert!(!store.room_history_complete(ROOM).unwrap());
+    let report = store.status().unwrap();
+    assert!(
+        !report.rooms[0].history_token_set,
+        "a missing token is not completion"
+    );
+    assert!(!report.rooms[0].history_complete);
+    assert!(store.render_status().unwrap().contains("no-token"));
+
+    // A later explicit prev_batch seeds only that never-started row.
+    let mut later = room_update(ROOM);
+    later.timeline = vec![message("$live2", 200, "live2")];
+    later.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![later]), 20)
+        .unwrap();
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+
+    // Progress from there; a still-later prev_batch must not rewind it.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("p2"), vec![message("$old", 50, "old")]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    let mut again = room_update(ROOM);
+    again.timeline = vec![message("$live3", 300, "live3")];
+    again.prev_batch = Some("q".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s3", vec![again]), 40)
+        .unwrap();
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p2"),
+        "in-progress backfill is never rewound"
+    );
+
+    // A completed base never adopts a later token either.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p2",
+            &history_page("p2", None, vec![]),
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+    let mut finished = room_update(ROOM);
+    finished.timeline = vec![message("$live4", 400, "live4")];
+    finished.prev_batch = Some("r".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s4", vec![finished]), 60)
+        .unwrap();
+    assert!(store.room_history_complete(ROOM).unwrap());
+    assert_eq!(store.room_history_token(ROOM).unwrap(), None);
 }

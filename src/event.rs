@@ -77,6 +77,14 @@ pub enum EventError {
     MissingType,
     #[error("event is missing a string `event_id`")]
     MissingEventId,
+    /// A redaction carries a target candidate, but the room version is missing
+    /// or is not one this build recognizes, so the field that holds the target
+    /// cannot be decided. The adapter must establish the room version from room
+    /// state before ingesting redactions; the archive refuses to guess.
+    #[error(
+        "cannot resolve m.room.redaction target: room version {version:?} is unknown or unsupported"
+    )]
+    UnknownRedactionRoomVersion { version: Option<String> },
 }
 
 pub const MESSAGE: &str = "m.room.message";
@@ -118,7 +126,6 @@ pub struct NormalizedEvent {
     /// The payload itself says the event is already redacted (for example
     /// `unsigned.redacted_because` or an empty content object for a message).
     pub redacted: bool,
-    pub encrypted: bool,
     /// Target of `m.room.redaction`, resolved with room-version rules.
     pub redaction_target: Option<String>,
     /// Validated replacements recovered from this event's
@@ -253,7 +260,7 @@ fn normalize_inner(
     }
 
     let redaction_target = if event_type == REDACTION {
-        resolve_redaction_target(obj, room_version)
+        resolve_redaction_target(obj, room_version)?
     } else {
         None
     };
@@ -299,7 +306,6 @@ fn normalize_inner(
         edit_attempt,
         thread_root_id,
         redacted: already_redacted,
-        encrypted: false,
         redaction_target,
         bundled_replacements,
     })
@@ -383,38 +389,54 @@ fn extract_bundled_replacements(
     vec![bundled]
 }
 
-/// Resolve the target of an `m.room.redaction` event using room-version rules.
+/// Resolve the target of an `m.room.redaction` event using the maintained Ruma
+/// room-version rules.
 ///
-/// Room version 11 moved `redacts` from the top level into `content`. For
-/// unknown room versions we prefer `content.redacts` when present and fall back
-/// to the top-level field.
+/// Room version 11 moved `redacts` into `content`: before v11 only the
+/// top-level field is authoritative, from v11 on only `content.redacts` is. A
+/// wrong-field-only or conflicting event therefore never deletes the other
+/// field's target. The room version must be exact and recognized; `11garbage`,
+/// a custom version or an absent version cannot be resolved and is an explicit
+/// error when the event carries any redaction-target candidate, rather than a
+/// guessed target or a silent drop.
 fn resolve_redaction_target(
     obj: &Map<String, Value>,
     room_version: Option<&str>,
-) -> Option<String> {
-    let top_level = obj
-        .get("redacts")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let in_content = obj
+) -> Result<Option<String>, EventError> {
+    let top_level = obj.get("redacts").and_then(Value::as_str);
+    let content_redacts = obj
         .get("content")
         .and_then(Value::as_object)
-        .and_then(|c| c.get("redacts"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+        .and_then(|content| content.get("redacts"));
+    let content_present = content_redacts.is_some();
+    let content_redacts = content_redacts.and_then(Value::as_str);
 
-    match version_major(room_version) {
-        Some(major) if major >= 11 => in_content.or(top_level),
-        Some(_) => top_level.or(in_content),
-        None => in_content.or(top_level),
+    // Nothing claims to name a target, so no version-dependent rule is needed.
+    if obj.get("redacts").is_none() && !content_present {
+        return Ok(None);
     }
-}
 
-/// Parse the numeric major part of a room version id, if it is a plain number.
-fn version_major(room_version: Option<&str>) -> Option<u64> {
-    let version = room_version?;
-    let digits: String = version.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    let Some(version) = room_version else {
+        return Err(EventError::UnknownRedactionRoomVersion { version: None });
+    };
+    let version: RoomVersionId =
+        version
+            .parse()
+            .map_err(|_| EventError::UnknownRedactionRoomVersion {
+                version: Some(version.to_owned()),
+            })?;
+    let Some(rules) = version.rules() else {
+        return Err(EventError::UnknownRedactionRoomVersion {
+            version: Some(version.to_string()),
+        });
+    };
+
+    let target = if rules.redaction.content_field_redacts {
+        content_redacts
+    } else {
+        top_level
+    };
+    Ok(target.map(str::to_owned))
 }
 
 /// Prune a redacted event down to the envelope and content the Matrix
@@ -876,5 +898,117 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ev.bundled_replacements.len(), 1);
+    }
+
+    #[test]
+    fn redaction_target_uses_only_the_authoritative_room_version_field() {
+        let top_only = json!({
+            "type": "m.room.redaction",
+            "event_id": "$red",
+            "redacts": "$top",
+            "content": {}
+        });
+        // v11+ ignores the top-level field entirely.
+        assert_eq!(
+            normalize("!r:example.org", &top_only, Some("11"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target,
+            None
+        );
+        assert_eq!(
+            normalize("!r:example.org", &top_only, Some("10"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target
+                .as_deref(),
+            Some("$top")
+        );
+
+        let content_only = json!({
+            "type": "m.room.redaction",
+            "event_id": "$red",
+            "content": { "redacts": "$content" }
+        });
+        // pre-v11 ignores the content field entirely.
+        assert_eq!(
+            normalize("!r:example.org", &content_only, Some("10"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target,
+            None
+        );
+        assert_eq!(
+            normalize("!r:example.org", &content_only, Some("11"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target
+                .as_deref(),
+            Some("$content")
+        );
+    }
+
+    #[test]
+    fn conflicting_redaction_fields_use_only_the_authoritative_target() {
+        let conflict = json!({
+            "type": "m.room.redaction",
+            "event_id": "$red",
+            "redacts": "$top",
+            "content": { "redacts": "$content" }
+        });
+        assert_eq!(
+            normalize("!r:example.org", &conflict, Some("11"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target
+                .as_deref(),
+            Some("$content")
+        );
+        assert_eq!(
+            normalize("!r:example.org", &conflict, Some("10"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target
+                .as_deref(),
+            Some("$top")
+        );
+    }
+
+    #[test]
+    fn redaction_target_needs_an_exact_recognized_room_version() {
+        let redaction = json!({
+            "type": "m.room.redaction",
+            "event_id": "$red",
+            "content": { "redacts": "$target" }
+        });
+        for version in [
+            None,
+            Some("11garbage"),
+            Some("org.example.custom"),
+            Some(""),
+        ] {
+            let error =
+                normalize("!r:example.org", &redaction, version, Source::Sync, 1).unwrap_err();
+            assert!(
+                matches!(error, EventError::UnknownRedactionRoomVersion { .. }),
+                "version {version:?} must not be guessed: {error}"
+            );
+        }
+        assert_eq!(
+            normalize("!r:example.org", &redaction, Some("12"), Source::Sync, 1)
+                .unwrap()
+                .redaction_target
+                .as_deref(),
+            Some("$target")
+        );
+    }
+
+    #[test]
+    fn redaction_without_a_target_field_needs_no_room_version() {
+        let bare = json!({
+            "type": "m.room.redaction",
+            "event_id": "$red",
+            "content": { "reason": "cleanup" }
+        });
+        assert_eq!(
+            normalize("!r:example.org", &bare, None, Source::Sync, 1)
+                .unwrap()
+                .redaction_target,
+            None
+        );
     }
 }

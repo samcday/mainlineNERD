@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 pub const ROOM: &str = "!room:hs.example.org";
 pub const ROOM2: &str = "!room2:hs.example.org";
+pub const ROOM3: &str = "!room3:hs.example.org";
 pub const ALICE: &str = "@alice:hs.example.org";
 pub const BOB: &str = "@bob:hs.example.org";
 
