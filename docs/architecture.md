@@ -27,11 +27,12 @@ credentials or network.
 - `sync_progress` — the opaque global `since` token, last success, failure count.
 - `rooms` — room id, room version, predecessor/successor, encrypted and
   operator-action flags.
-- `room_history` — per-room opaque history token, `complete`, `stalled`, page
-  count, last error.
-- `gap_jobs` — bounded repair jobs: `boundary_token` (last known position before
-  the gap), `upper_token` (where repair starts), status
-  `open|repaired|unresolved`.
+- `room_history` — per-room base archival backfill cursor: opaque history token,
+  `complete`, `stalled`, page count, last error.
+- `gap_jobs` — bounded repair jobs, one per limited-sync gap: `boundary_token`
+  (lower bound: the previously committed global sync token), `upper_token`
+  (where repair starts: this timeline's `prev_batch`), `cursor_token` (the
+  job's own durable repair cursor), status `open|repaired|unresolved`.
 - `events` — normalized envelope per `(room_id, event_id)`: type, sender,
   state key, origin timestamp, first/last observed timestamps, source
   (`sync|history`), raw JSON (redacted-pruned), extracted body text, relation
@@ -47,11 +48,14 @@ not reuse SDK store tables.
 
 ## Transactional guarantees
 
-- A `/sync` batch commits all room events plus the global `next_batch` token in
-  one transaction. A limited sync persists its gap job in the same transaction,
-  before the token advances.
-- A `/messages` page commits its events plus the room's next history token in one
-  transaction.
+- Schema bootstrap creates every table and records `user_version` in one
+  transaction; a failure in a late statement rolls the whole bootstrap back, so
+  a half-initialized archive cannot be opened later. Writes use
+  `synchronous=FULL`, matching the committed-batch guarantee.
+- A `/sync` batch commits all room events, any new bounded gap repair jobs and
+  the global `next_batch` token in one transaction, before the token advances.
+- A `/messages` page commits its events plus the next value of exactly one
+  work-item cursor in one transaction.
 - Any malformed envelope aborts and rolls back the whole batch/page; neither
   events nor cursors advance. The error names the room and event.
 - Replaying overlapping events is idempotent by `(room_id, event_id)`.
@@ -62,18 +66,42 @@ not reuse SDK store tables.
 ## Cursor and gap discipline
 
 - Progress is always an opaque token. Timestamps are metadata only and are never
-  used as stream coverage.
+  used as stream coverage or cursor ordering.
+- Each room has one base archival backfill cursor. A limited sync never rewinds
+  or resets it: backfill keeps walking back from the earliest known live
+  position even while a gap is being repaired.
+- The first sync has no previous committed token, so a limited initial snapshot
+  is archival backfill, not a missing-live interval. Afterwards a limited sync
+  creates a bounded repair job with its own durable cursor: `boundary_token` is
+  the previously committed global sync token (lower bound), `upper_token` is
+  this timeline's `prev_batch`, and `cursor_token` is where repair has reached.
+  A limited sync with no `prev_batch` is recorded `unresolved` and never claims
+  coverage. A room with completed base history can still have open repair jobs.
+- Repair requests carry their lower bound as `to`. A response updates only the
+  work item actually requested: exhaustion of one gap never completes another
+  gap or the base backfill. The job closes at its boundary token or at the
+  start of accessible history.
+- A response is validated against the durable cursor of its work item before
+  anything is stored. A page whose cursor has already moved is stale and
+  changes nothing, so an out-of-order in-flight response cannot overwrite newer
+  progress. Every work item resumes independently after reopen.
 - An empty `/messages` page with a fresh `end` token is not completion: the
-  engine keeps paging. `end` absent means the start of accessible history.
-- A page whose `end` equals its `start` is a stall; the room is marked
-  `stalled`, its token does not advance, and open gaps become `unresolved`.
-  The engine also remembers visited tokens per run, so a `p1 -> p2 -> p1` cycle
-  stops after two requests instead of looping.
-- A limited sync records `boundary_token` (previous position) and `upper_token`
-  (new `prev_batch`) and repairs from `upper_token` backwards. The job closes
-  when pagination reaches the boundary token, or when the start of history is
-  reached. Until then it is reported in `status`; completeness is never claimed
-  for an unresolved gap.
+  engine keeps paging, for gap jobs as well as backfill. `end` absent means the
+  start of accessible history. A page whose `end` equals its `start` is a
+  stall; that work item is marked `stalled` (base) or `unresolved` (gap)
+  without advancing its cursor. The engine remembers visited tokens per work
+  item, so a `p1 -> p2 -> p1` cycle stops instead of looping.
+
+## History failure isolation
+
+- A room-local permanent failure (forbidden/not found) is recorded on that room
+  and later rooms still progress; the failing room is stalled with the error
+  surfaced in `status`.
+- A transient failure defers only that work item: its cursor is untouched and
+  it stays queued for a later run.
+- An authentication failure stops the whole run; a rate limit stops the run
+  early with a partial outcome and a retry hint instead of hammering remaining
+  rooms.
 
 ## Projection rules
 

@@ -120,6 +120,7 @@ CREATE TABLE gap_jobs (
   reason TEXT NOT NULL,
   boundary_token TEXT,
   upper_token TEXT,
+  cursor_token TEXT,
   status TEXT NOT NULL DEFAULT 'open',
   closed_at INTEGER,
   close_reason TEXT
@@ -197,6 +198,9 @@ pub enum HistoryStatus {
     Advanced,
     Completed,
     Stalled,
+    /// The response no longer matches the durable cursor of the work item it
+    /// was requested for; nothing was applied.
+    Stale,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -242,11 +246,31 @@ pub struct StatusReport {
     pub rooms: Vec<RoomStatus>,
 }
 
-/// A room with unfinished (or stalled) history work.
+/// A room with unfinished (or stalled) base archival backfill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryPosition {
     pub room_id: String,
     pub token: String,
+}
+
+/// Which durable cursor a `/messages` response belongs to. Base backfill and
+/// each bounded gap repair job have independent cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HistoryWork {
+    Base,
+    Gap(i64),
+}
+
+/// One bounded gap repair job with its own durable cursor and lower bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapPosition {
+    pub gap_id: i64,
+    pub room_id: String,
+    /// The cursor the next page must be requested from.
+    pub token: String,
+    /// The lower bound of the bounded repair (the previous committed sync
+    /// token). Bounded repair stops here; it never walks past it.
+    pub to_token: Option<String>,
 }
 
 /// The durable archive.
@@ -263,7 +287,7 @@ impl Store {
             }
         }
         let conn = Self::configure(Connection::open(path)?, false)?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.ensure_schema(false)?;
         store.ensure_binding(identity)?;
         Ok(store)
@@ -278,7 +302,7 @@ impl Store {
             )?,
             true,
         )?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.ensure_schema(true)?;
         store.require_binding()?;
         Ok(store)
@@ -287,13 +311,18 @@ impl Store {
     fn configure(conn: Connection, read_only: bool) -> Result<Connection, StoreError> {
         conn.busy_timeout(Duration::from_secs(5))?;
         if !read_only {
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+            // FULL keeps the documented guarantee that a committed batch/page
+            // survives a crash; WAL with NORMAL may lose acknowledged commits
+            // on power loss.
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         }
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(conn)
     }
 
-    fn ensure_schema(&self, read_only: bool) -> Result<(), StoreError> {
+    /// Create the schema and its version in one transaction, so a late DDL
+    /// failure cannot strand a half-initialized archive.
+    fn ensure_schema(&mut self, read_only: bool) -> Result<(), StoreError> {
         let found: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -307,9 +336,12 @@ impl Store {
             if read_only {
                 return Err(StoreError::Unbound);
             }
-            self.conn.execute_batch(SCHEMA_SQL)?;
-            self.conn
-                .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(SCHEMA_SQL)?;
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -410,9 +442,11 @@ impl Store {
         Ok(())
     }
 
-    /// Commit one `/sync` batch: all room events and the global `next_batch`
-    /// token in a single transaction. Limited syncs persist bounded gap repair
-    /// jobs in the same transaction, before the token advances.
+    /// Commit one `/sync` batch: all room events, bounded gap repair jobs and
+    /// the global `next_batch` token in a single transaction. Each limited
+    /// sync gap is bounded by the previously committed global token and gets
+    /// its own durable cursor; the room's base backfill cursor is never
+    /// rewound or reset by a live batch.
     pub fn apply_sync_batch(
         &mut self,
         batch: &SyncBatch,
@@ -421,9 +455,20 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_since: Option<String> = tx.query_row(
+            "SELECT since_token FROM sync_progress WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
         let mut outcome = SyncApplyOutcome::default();
         for room in &batch.rooms {
-            apply_sync_room(&tx, room, received_at, &mut outcome)?;
+            apply_sync_room(
+                &tx,
+                room,
+                previous_since.as_deref(),
+                received_at,
+                &mut outcome,
+            )?;
         }
         tx.execute(
             "UPDATE sync_progress SET since_token = ?1, last_success_at = ?2, consecutive_failures = 0, last_error = NULL WHERE id = 1",
@@ -433,10 +478,17 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Commit one `/messages` page and its per-room cursor atomically.
+    /// Commit one `/messages` page and update exactly the durable cursor the
+    /// page was requested for: the room's base backfill cursor or one bounded
+    /// gap repair job. `expected_from` must still match that cursor at
+    /// application time; a late in-flight page whose cursor has moved is
+    /// reported as [`HistoryStatus::Stale`] and changes nothing. Exhaustion,
+    /// stalls and completion of one work item never close another.
     pub fn apply_history_page(
         &mut self,
         room_id: &str,
+        work: HistoryWork,
+        expected_from: &str,
         page: &HistoryPage,
         received_at: i64,
     ) -> Result<HistoryApplyOutcome, StoreError> {
@@ -446,9 +498,40 @@ impl Store {
         if !room_exists(&tx, room_id)? {
             return Err(StoreError::UnknownRoom(room_id.to_owned()));
         }
-        let room_version = room_version(&tx, room_id)?;
-        let current = history_token(&tx, room_id)?;
 
+        // Validate the work item before storing anything, so a stale response
+        // cannot touch events or cursor state.
+        let target = match work {
+            HistoryWork::Base => {
+                if history_token(&tx, room_id)?.as_deref() != Some(expected_from) {
+                    return Ok(HistoryApplyOutcome {
+                        status: Some(HistoryStatus::Stale),
+                        ..Default::default()
+                    });
+                }
+                AppliedWork::Base
+            }
+            HistoryWork::Gap(gap_id) => match gap_row(&tx, gap_id)? {
+                Some(gap)
+                    if gap.room_id == room_id
+                        && gap.status == "open"
+                        && gap.cursor_token.as_deref() == Some(expected_from) =>
+                {
+                    AppliedWork::Gap {
+                        gap_id,
+                        boundary: gap.boundary_token,
+                    }
+                }
+                _ => {
+                    return Ok(HistoryApplyOutcome {
+                        status: Some(HistoryStatus::Stale),
+                        ..Default::default()
+                    });
+                }
+            },
+        };
+
+        let room_version = room_version(&tx, room_id)?;
         let mut outcome = HistoryApplyOutcome::default();
         for value in &page.chunk {
             let event = normalize_event(
@@ -464,53 +547,98 @@ impl Store {
             }
         }
 
-        let repeated = page.end.is_some() && page.end == current;
-        if repeated {
-            outcome.status = Some(HistoryStatus::Stalled);
-            mark_history_stalled(
-                &tx,
-                room_id,
-                "history pagination returned a repeated token",
-                received_at,
-            )?;
-        } else {
-            match &page.end {
-                None => {
-                    tx.execute(
-                        "UPDATE room_history SET token = NULL, complete = 1, stalled = 0, pages = pages + 1, last_error = NULL, updated_at = ?2 WHERE room_id = ?1",
-                        params![room_id, received_at],
-                    )?;
-                    tx.execute(
-                        "UPDATE gap_jobs SET status = 'repaired', closed_at = ?2, close_reason = 'history_start' WHERE room_id = ?1 AND status = 'open'",
-                        params![room_id, received_at],
-                    )?;
-                    outcome.status = Some(HistoryStatus::Completed);
-                }
-                Some(end) => {
-                    tx.execute(
-                        "UPDATE room_history SET token = ?2, complete = 0, stalled = 0, pages = pages + 1, last_error = NULL, updated_at = ?3 WHERE room_id = ?1",
-                        params![room_id, end, received_at],
-                    )?;
-                    tx.execute(
-                        "UPDATE gap_jobs SET status = 'repaired', closed_at = ?3, close_reason = 'token' WHERE room_id = ?1 AND status = 'open' AND boundary_token = ?2",
-                        params![room_id, end, received_at],
-                    )?;
-                    outcome.status = Some(HistoryStatus::Advanced);
-                }
+        let repeated = page.end.as_deref() == Some(expected_from);
+        match (&target, &page.end, repeated) {
+            (AppliedWork::Base, _, true) => {
+                mark_base_stalled(
+                    &tx,
+                    room_id,
+                    "history pagination returned a repeated token",
+                    received_at,
+                )?;
+                outcome.status = Some(HistoryStatus::Stalled);
+            }
+            (AppliedWork::Base, None, _) => {
+                tx.execute(
+                    "UPDATE room_history SET token = NULL, complete = 1, stalled = 0, pages = pages + 1, last_error = NULL, updated_at = ?2 WHERE room_id = ?1",
+                    params![room_id, received_at],
+                )?;
+                outcome.status = Some(HistoryStatus::Completed);
+            }
+            (AppliedWork::Base, Some(end), _) => {
+                tx.execute(
+                    "UPDATE room_history SET token = ?2, complete = 0, stalled = 0, pages = pages + 1, last_error = NULL, updated_at = ?3 WHERE room_id = ?1",
+                    params![room_id, end, received_at],
+                )?;
+                outcome.status = Some(HistoryStatus::Advanced);
+            }
+            (AppliedWork::Gap { gap_id, .. }, _, true) => {
+                close_gap(
+                    &tx,
+                    *gap_id,
+                    "unresolved",
+                    "history pagination returned a repeated token",
+                    received_at,
+                )?;
+                outcome.status = Some(HistoryStatus::Stalled);
+            }
+            (AppliedWork::Gap { gap_id, .. }, None, _) => {
+                close_gap(&tx, *gap_id, "repaired", "history_start", received_at)?;
+                outcome.status = Some(HistoryStatus::Completed);
+            }
+            (AppliedWork::Gap { gap_id, boundary }, Some(end), _)
+                if boundary.as_deref() == Some(end.as_str()) =>
+            {
+                close_gap(&tx, *gap_id, "repaired", "token", received_at)?;
+                outcome.status = Some(HistoryStatus::Completed);
+            }
+            (AppliedWork::Gap { gap_id, .. }, Some(end), _) => {
+                tx.execute(
+                    "UPDATE gap_jobs SET cursor_token = ?2 WHERE gap_id = ?1",
+                    params![gap_id, end],
+                )?;
+                outcome.status = Some(HistoryStatus::Advanced);
             }
         }
         tx.commit()?;
         Ok(outcome)
     }
 
-    /// Mark a room's history pagination stalled without advancing its token.
+    /// Mark a room's base backfill stalled without advancing its token. Gap
+    /// repair jobs are independent work items and are not touched.
     pub fn mark_history_stalled(
-        &mut self,
+        &self,
         room_id: &str,
         reason: &str,
         at: i64,
     ) -> Result<(), StoreError> {
-        mark_history_stalled(&self.conn, room_id, reason, at)
+        mark_base_stalled(&self.conn, room_id, reason, at)
+    }
+
+    /// Persist a non-terminal base backfill error without stalling the room,
+    /// so the work item is retried on a later run.
+    pub fn record_history_error(
+        &self,
+        room_id: &str,
+        error: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE room_history SET last_error = ?2, updated_at = ?3 WHERE room_id = ?1",
+            params![room_id, error, at],
+        )?;
+        Ok(())
+    }
+
+    /// Close one gap repair job as unresolved (for example after a repeated
+    /// token). Other jobs and the base cursor are untouched.
+    pub fn mark_gap_unresolved(
+        &self,
+        gap_id: i64,
+        reason: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        close_gap(&self.conn, gap_id, "unresolved", reason, at)
     }
 
     /// Rooms with a usable history token that are not complete or stalled,
@@ -532,6 +660,49 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Open bounded gap repair jobs, oldest first, each with its own durable
+    /// cursor. These are serviced separately from [`Self::rooms_needing_history`].
+    pub fn open_gap_positions(&self) -> Result<Vec<GapPosition>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT gap_id, room_id, cursor_token, boundary_token FROM gap_jobs
+             WHERE status = 'open' AND cursor_token IS NOT NULL
+             ORDER BY gap_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GapPosition {
+                gap_id: row.get(0)?,
+                room_id: row.get(1)?,
+                token: row.get(2)?,
+                to_token: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One open gap repair job, if it is still open and has a cursor.
+    pub fn open_gap_position(&self, gap_id: i64) -> Result<Option<GapPosition>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT gap_id, room_id, cursor_token, boundary_token FROM gap_jobs
+                 WHERE gap_id = ?1 AND status = 'open' AND cursor_token IS NOT NULL",
+                params![gap_id],
+                |row| {
+                    Ok(GapPosition {
+                        gap_id: row.get(0)?,
+                        room_id: row.get(1)?,
+                        token: row.get(2)?,
+                        to_token: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn room_history_token(&self, room_id: &str) -> Result<Option<String>, StoreError> {
@@ -910,6 +1081,7 @@ fn get_event_row(
 fn apply_sync_room(
     conn: &Connection,
     room: &event::SyncRoomUpdate,
+    previous_since: Option<&str>,
     received_at: i64,
     outcome: &mut SyncApplyOutcome,
 ) -> Result<(), StoreError> {
@@ -1013,49 +1185,71 @@ fn apply_sync_room(
         .is_some();
 
     if room.limited {
-        let boundary = history_token(conn, &room.room_id)?;
-        match room.prev_batch.clone() {
-            Some(upper) => {
-                let inserted = conn.execute(
-                    "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, status)
-                     VALUES (?1, ?2, 'limited_sync', ?3, ?4, 'open')
-                     ON CONFLICT(room_id, upper_token) DO NOTHING",
-                    params![room.room_id, received_at, boundary, upper],
-                )?;
-                outcome.gaps_opened += inserted as u64;
-                conn.execute(
-                    "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
-                     VALUES (?1, ?2, 0, 0, 0, ?3)
-                     ON CONFLICT(room_id) DO UPDATE SET token = excluded.token, complete = 0, stalled = 0, updated_at = excluded.updated_at",
-                    params![room.room_id, upper, received_at],
-                )?;
-            }
+        match previous_since {
+            // The first sync has no previous committed token: it is the start
+            // of archival backfill, not a missing-live interval.
             None => {
-                // No repair token: record the gap as unresolved rather than
-                // pretending the timeline is complete.
-                conn.execute(
-                    "INSERT INTO gap_jobs (room_id, created_at, reason, upper_token, status, close_reason)
-                     VALUES (?1, ?2, 'limited_sync_no_prev_batch', NULL, 'unresolved', 'no repair token available')",
-                    params![room.room_id, received_at],
-                )?;
-                outcome.gaps_opened += 1;
                 if !has_history {
-                    conn.execute(
-                        "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
-                         VALUES (?1, NULL, 0, 0, 0, ?2)",
-                        params![room.room_id, received_at],
+                    insert_room_history(
+                        conn,
+                        &room.room_id,
+                        room.prev_batch.as_deref(),
+                        received_at,
                     )?;
                 }
             }
+            Some(boundary) => match room.prev_batch.as_deref() {
+                Some(upper) => {
+                    let inserted = conn.execute(
+                        "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status)
+                         VALUES (?1, ?2, 'limited_sync', ?3, ?4, ?4, 'open')
+                         ON CONFLICT(room_id, upper_token) DO NOTHING",
+                        params![room.room_id, received_at, boundary, upper],
+                    )?;
+                    outcome.gaps_opened += inserted as u64;
+                    if !has_history {
+                        // Base backfill still starts at this timeline's
+                        // prev_batch; the gap job only repairs the bounded
+                        // live interval, it does not own the room cursor.
+                        insert_room_history(conn, &room.room_id, Some(upper), received_at)?;
+                    }
+                }
+                None => {
+                    // No repair token: record the gap as unresolved rather
+                    // than pretending the timeline is complete.
+                    conn.execute(
+                        "INSERT INTO gap_jobs (room_id, created_at, reason, boundary_token, upper_token, cursor_token, status, close_reason)
+                         VALUES (?1, ?2, 'limited_sync_no_prev_batch', ?3, NULL, NULL, 'unresolved', 'no repair token available')",
+                        params![room.room_id, received_at, boundary],
+                    )?;
+                    outcome.gaps_opened += 1;
+                    if !has_history {
+                        insert_room_history(conn, &room.room_id, None, received_at)?;
+                    }
+                }
+            },
         }
     } else if !has_history {
-        conn.execute(
-            "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
-             VALUES (?1, ?2, 0, 0, 0, ?3)",
-            params![room.room_id, room.prev_batch, received_at],
-        )?;
+        insert_room_history(conn, &room.room_id, room.prev_batch.as_deref(), received_at)?;
     }
 
+    Ok(())
+}
+
+/// Seed a room's base backfill cursor. Never rewinds or resets an existing
+/// row: a live batch must not clobber in-progress archival backfill.
+fn insert_room_history(
+    conn: &Connection,
+    room_id: &str,
+    token: Option<&str>,
+    at: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
+         VALUES (?1, ?2, 0, 0, 0, ?3)
+         ON CONFLICT(room_id) DO NOTHING",
+        params![room_id, token, at],
+    )?;
     Ok(())
 }
 
@@ -1396,7 +1590,7 @@ fn upsert_projection(
     Ok(())
 }
 
-fn mark_history_stalled(
+fn mark_base_stalled(
     conn: &Connection,
     room_id: &str,
     reason: &str,
@@ -1406,10 +1600,53 @@ fn mark_history_stalled(
         "UPDATE room_history SET stalled = 1, last_error = ?2, updated_at = ?3 WHERE room_id = ?1",
         params![room_id, reason, at],
     )?;
+    Ok(())
+}
+
+/// The validated work item a page is about to update.
+enum AppliedWork {
+    Base,
+    Gap {
+        gap_id: i64,
+        boundary: Option<String>,
+    },
+}
+
+struct GapRow {
+    room_id: String,
+    status: String,
+    cursor_token: Option<String>,
+    boundary_token: Option<String>,
+}
+
+fn gap_row(conn: &Connection, gap_id: i64) -> Result<Option<GapRow>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT room_id, status, cursor_token, boundary_token FROM gap_jobs WHERE gap_id = ?1",
+            params![gap_id],
+            |row| {
+                Ok(GapRow {
+                    room_id: row.get(0)?,
+                    status: row.get(1)?,
+                    cursor_token: row.get(2)?,
+                    boundary_token: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn close_gap(
+    conn: &Connection,
+    gap_id: i64,
+    status: &str,
+    reason: &str,
+    at: i64,
+) -> Result<(), StoreError> {
     conn.execute(
-        "UPDATE gap_jobs SET status = 'unresolved', closed_at = ?2, close_reason = ?3
-         WHERE room_id = ?1 AND status = 'open'",
-        params![room_id, at, reason],
+        "UPDATE gap_jobs SET status = ?2, cursor_token = NULL, closed_at = ?3, close_reason = ?4
+         WHERE gap_id = ?1 AND status = 'open'",
+        params![gap_id, status, at, reason],
     )?;
     Ok(())
 }

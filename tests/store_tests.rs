@@ -4,33 +4,100 @@
 mod common;
 
 use common::*;
-use mainlinenerd_ingest::store::{HistoryStatus, StoreError};
+use mainlinenerd_ingest::store::{HistoryStatus, HistoryWork, StoreError};
 use serde_json::json;
 
 #[test]
-fn malformed_event_rolls_back_batch_and_checkpoint() {
+fn failed_schema_bootstrap_rolls_back_entirely() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    {
+        // A pre-existing table makes the last CREATE TABLE in the bootstrap
+        // fail after earlier statements have already run.
+        let conn = db(&path);
+        conn.execute_batch("CREATE TABLE current_messages (x INTEGER);")
+            .unwrap();
+    }
+
+    let error = match mainlinenerd_ingest::store::Store::open(&path, &identity()) {
+        Ok(_) => panic!("expected the schema bootstrap to fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::Sqlite(_)));
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(&conn, "PRAGMA user_version"),
+        0,
+        "a failed bootstrap must not record a schema version"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'archive_meta'"
+        ),
+        0,
+        "tables created before the failure must roll back"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_progress'"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gap_jobs'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn malformed_event_rolls_back_batch_checkpoint_and_new_gaps() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archive.db");
     let mut store = open_store(&path);
 
-    let mut room = room_update(ROOM);
-    room.timeline = vec![
-        message("$ok", 100, "one"),
-        json!({"type": "m.room.message"}),
-    ];
+    // Establish a previously committed sync token.
+    let mut seed = room_update(ROOM2);
+    seed.timeline = vec![message("$seed", 50, "seed")];
+    seed.prev_batch = Some("p0".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s0", vec![seed]), 5)
+        .unwrap();
+    assert_eq!(store.since_token().unwrap().as_deref(), Some("s0"));
+
+    // ROOM's limited sync would persist a new bounded gap job; the malformed
+    // event in the second room then fails the batch, so events, the new gap
+    // and the global next_batch must all roll back together.
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$ok", 100, "one")];
+    limited.prev_batch = Some("p1".to_owned());
+    limited.limited = true;
+    let mut bad = room_update("!bad:hs.example.org");
+    bad.timeline = vec![json!({"type": "m.room.message"})];
     let error = store
-        .apply_sync_batch(&sync_batch("s1", vec![room]), 10)
+        .apply_sync_batch(&sync_batch("s1", vec![limited, bad]), 10)
         .unwrap_err();
     assert!(matches!(error, StoreError::MalformedEvent { .. }));
-    assert_eq!(store.since_token().unwrap(), None);
+    assert_eq!(store.since_token().unwrap().as_deref(), Some("s0"));
+    assert!(store.open_gap_positions().unwrap().is_empty());
     drop(store);
 
     let conn = db(&path);
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM events"), 0);
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM rooms"), 0);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+        1,
+        "only the pre-existing seed event survives"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM rooms"), 1);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM gap_jobs"), 0);
     assert_eq!(
         scalar_string(&conn, "SELECT since_token FROM sync_progress WHERE id = 1"),
-        None
+        Some("s0".to_owned())
     );
 }
 
@@ -397,12 +464,54 @@ fn unknown_events_are_stored_but_not_projected_and_room_flags_surface() {
 }
 
 #[test]
-fn limited_sync_creates_bounded_gap_job_and_repair_closes_it() {
+fn initial_limited_sync_is_backfill_not_a_gap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archive.db");
     let mut store = open_store(&path);
 
-    // Initial sync seeds the history cursor with prev_batch.
+    // The first sync has no previous committed token: its prev_batch seeds the
+    // base backfill and no live gap exists yet.
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p1".to_owned());
+    initial.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+    assert!(!store.room_history_complete(ROOM).unwrap());
+    assert!(store.open_gap_positions().unwrap().is_empty());
+    assert_eq!(store.status().unwrap().rooms[0].open_gaps, 0);
+
+    // The next limited sync does have a previous token, so it opens a bounded
+    // gap covering [s1, p2].
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![limited]), 20)
+        .unwrap();
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].token, "p2");
+    assert_eq!(gaps[0].to_token.as_deref(), Some("s1"));
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+}
+
+#[test]
+fn limited_sync_gap_repairs_without_moving_base_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    // Initial sync seeds the base backfill cursor with prev_batch.
     let mut initial = room_update(ROOM);
     initial.timeline = vec![message("$live", 100, "live")];
     initial.prev_batch = Some("p1".to_owned());
@@ -414,8 +523,8 @@ fn limited_sync_creates_bounded_gap_job_and_repair_closes_it() {
         Some("p1")
     );
 
-    // A limited sync arrives: events between the old position and the new
-    // timeline were skipped, so a gap job must exist before the token moves.
+    // A later limited sync creates an independent bounded repair job and must
+    // not rewind the in-progress backfill position.
     let mut limited = room_update(ROOM);
     limited.timeline = vec![message("$live2", 300, "live2")];
     limited.prev_batch = Some("p2".to_owned());
@@ -426,62 +535,77 @@ fn limited_sync_creates_bounded_gap_job_and_repair_closes_it() {
     assert_eq!(store.since_token().unwrap().as_deref(), Some("s2"));
     assert_eq!(
         store.room_history_token(ROOM).unwrap().as_deref(),
-        Some("p2")
+        Some("p1"),
+        "a limited live batch must not reset archival backfill"
     );
+
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 1);
+    let gap_id = gaps[0].gap_id;
+    assert_eq!(gaps[0].room_id, ROOM);
+    assert_eq!(gaps[0].token, "p2");
+    assert_eq!(gaps[0].to_token.as_deref(), Some("s1"));
     {
         let conn = db(&path);
         assert_eq!(
-            scalar_string(
-                &conn,
-                "SELECT boundary_token FROM gap_jobs WHERE status = 'open'"
-            ),
-            Some("p1".to_owned())
+            conn.query_row(
+                "SELECT boundary_token FROM gap_jobs WHERE gap_id = ?1",
+                [gap_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+            Some("s1".to_owned())
         );
         assert_eq!(
-            scalar_string(
-                &conn,
-                "SELECT upper_token FROM gap_jobs WHERE status = 'open'"
-            ),
+            conn.query_row(
+                "SELECT cursor_token FROM gap_jobs WHERE gap_id = ?1",
+                [gap_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
             Some("p2".to_owned())
         );
     }
 
-    // Repair walks backward from p2; the gap closes at its recorded boundary.
+    // Repair only the gap: p2 -> p3, then p3 -> its boundary s1.
     let outcome = store
         .apply_history_page(
             ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
             &history_page("p2", Some("p3"), vec![message("$gap1", 200, "gap1")]),
             30,
         )
         .unwrap();
     assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
     assert_eq!(
-        scalar_i64(
-            &db(&path),
-            "SELECT COUNT(*) FROM gap_jobs WHERE status = 'open'"
-        ),
-        1
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1"),
+        "gap repair must not move the base cursor"
     );
+    assert_eq!(store.open_gap_positions().unwrap()[0].token, "p3");
 
     let outcome = store
         .apply_history_page(
             ROOM,
-            &history_page("p3", Some("p1"), vec![message("$gap0", 50, "gap0")]),
+            HistoryWork::Gap(gap_id),
+            "p3",
+            &history_page("p3", Some("s1"), vec![message("$gap0", 50, "gap0")]),
             40,
         )
         .unwrap();
-    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+    assert!(store.open_gap_positions().unwrap().is_empty());
+    assert!(!store.room_history_complete(ROOM).unwrap());
 
     let conn = db(&path);
     assert_eq!(
-        scalar_i64(&conn, "SELECT COUNT(*) FROM gap_jobs WHERE status = 'open'"),
-        0
-    );
-    assert_eq!(
-        scalar_string(
-            &conn,
-            "SELECT close_reason FROM gap_jobs WHERE room_id = '!room:hs.example.org'"
-        ),
+        conn.query_row(
+            "SELECT close_reason FROM gap_jobs WHERE gap_id = ?1",
+            [gap_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
         Some("token".to_owned())
     );
     assert_eq!(
@@ -489,10 +613,23 @@ fn limited_sync_creates_bounded_gap_job_and_repair_closes_it() {
         4,
         "live, live2 and both gap events must be present"
     );
+
+    // Base backfill continues from its own cursor, unaffected by the repair.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", None, vec![message("$old", 10, "old")]),
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+    assert!(store.room_history_complete(ROOM).unwrap());
 }
 
 #[test]
-fn stalled_history_token_is_persisted_and_reported() {
+fn limited_sync_without_prev_batch_stays_unresolved() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archive.db");
     let mut store = open_store(&path);
@@ -506,31 +643,40 @@ fn stalled_history_token_is_persisted_and_reported() {
 
     let mut limited = room_update(ROOM);
     limited.timeline = vec![message("$live2", 300, "live2")];
-    limited.prev_batch = Some("p2".to_owned());
+    limited.prev_batch = None;
     limited.limited = true;
     store
         .apply_sync_batch(&sync_batch("s2", vec![limited]), 20)
         .unwrap();
 
-    // Empty page returning the same token makes no progress: stall, do not loop.
-    let outcome = store
-        .apply_history_page(ROOM, &history_page("p2", Some("p2"), vec![]), 30)
-        .unwrap();
-    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
+    assert!(store.open_gap_positions().unwrap().is_empty());
     assert_eq!(
         store.room_history_token(ROOM).unwrap().as_deref(),
-        Some("p2")
+        Some("p1"),
+        "an unresolvable gap must not touch the base cursor"
     );
-
     let report = store.status().unwrap();
-    let room = &report.rooms[0];
-    assert!(room.history_stalled);
-    assert_eq!(room.unresolved_gaps, 1);
-    assert_eq!(room.open_gaps, 0);
+    assert_eq!(report.rooms[0].open_gaps, 0);
+    assert_eq!(report.rooms[0].unresolved_gaps, 1);
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT status FROM gap_jobs WHERE reason = 'limited_sync_no_prev_batch'"
+        ),
+        Some("unresolved".to_owned())
+    );
+    assert_eq!(
+        scalar_string(
+            &conn,
+            "SELECT close_reason FROM gap_jobs WHERE reason = 'limited_sync_no_prev_batch'"
+        ),
+        Some("no repair token available".to_owned())
+    );
 }
 
 #[test]
-fn reaching_history_start_completes_and_closes_gaps() {
+fn completed_base_history_can_still_have_open_gap_repair() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archive.db");
     let mut store = open_store(&path);
@@ -541,7 +687,297 @@ fn reaching_history_start_completes_and_closes_gaps() {
     store
         .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
         .unwrap();
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", None, vec![]),
+            20,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
 
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![limited]), 30)
+        .unwrap();
+
+    assert!(store.room_history_complete(ROOM).unwrap());
+    assert_eq!(store.rooms_needing_history().unwrap().len(), 0);
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 1, "completed history does not close open gaps");
+    assert_eq!(gaps[0].token, "p2");
+    assert_eq!(gaps[0].to_token.as_deref(), Some("s1"));
+}
+
+#[test]
+fn two_limited_syncs_create_independently_resumable_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+
+    {
+        let mut store = open_store(&path);
+        let mut initial = room_update(ROOM);
+        initial.timeline = vec![message("$live", 100, "live")];
+        initial.prev_batch = Some("p0".to_owned());
+        store
+            .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+            .unwrap();
+        assert_eq!(
+            store.room_history_token(ROOM).unwrap().as_deref(),
+            Some("p0")
+        );
+
+        for (next_batch, prev_batch, at) in [("s2", "p1", 20), ("s3", "p2", 30)] {
+            let mut limited = room_update(ROOM);
+            limited.timeline = vec![message(&format!("$live-{prev_batch}"), 300, "live")];
+            limited.prev_batch = Some(prev_batch.to_owned());
+            limited.limited = true;
+            store
+                .apply_sync_batch(&sync_batch(next_batch, vec![limited]), at)
+                .unwrap();
+        }
+
+        let gaps = store.open_gap_positions().unwrap();
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0].to_token.as_deref(), Some("s1"));
+        assert_eq!(gaps[1].to_token.as_deref(), Some("s2"));
+        assert_eq!(gaps[0].token, "p1");
+        assert_eq!(gaps[1].token, "p2");
+
+        // Advance each job independently; an empty middle page still moves the
+        // job's own cursor.
+        let outcome = store
+            .apply_history_page(
+                ROOM,
+                HistoryWork::Gap(gaps[0].gap_id),
+                "p1",
+                &history_page("p1", Some("q1"), vec![]),
+                40,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+        let outcome = store
+            .apply_history_page(
+                ROOM,
+                HistoryWork::Gap(gaps[1].gap_id),
+                "p2",
+                &history_page("p2", Some("q2"), vec![]),
+                50,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    }
+
+    // Reopen: both cursors resume exactly where they stopped.
+    let mut store = open_store(&path);
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p0"),
+        "reopening resumes base backfill from its persisted cursor"
+    );
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 2);
+    assert_eq!(gaps[0].token, "q1");
+    assert_eq!(gaps[1].token, "q2");
+
+    // Exhausting one job must not close the other.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gaps[0].gap_id),
+            "q1",
+            &history_page("q1", None, vec![message("$a", 400, "a")]),
+            60,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+    assert_eq!(store.open_gap_positions().unwrap().len(), 1);
+    assert_eq!(store.open_gap_positions().unwrap()[0].token, "q2");
+
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gaps[1].gap_id),
+            "q2",
+            &history_page("q2", Some("s2"), vec![message("$b", 410, "b")]),
+            70,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+    assert!(store.open_gap_positions().unwrap().is_empty());
+}
+
+#[test]
+fn stale_history_response_cannot_overwrite_newer_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![limited]), 20)
+        .unwrap();
+    let gap_id = store.open_gap_positions().unwrap()[0].gap_id;
+
+    // The base cursor advances p1 -> p2.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("p2b"), vec![message("$new", 200, "new")]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+
+    // A late page for the old p1 must not move the base cursor or store events.
+    let events_before = {
+        let conn = db(&path);
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events")
+    };
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("stale"), vec![message("$stale", 210, "stale")]),
+            40,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stale));
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p2b")
+    );
+    {
+        let conn = db(&path);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+            events_before,
+            "a stale base page must not store events"
+        );
+    }
+
+    // The gap cursor advances p2 -> p3; a late page for p2 is stale too.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
+            &history_page("p2", Some("p3"), vec![message("$gap", 220, "gap")]),
+            50,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Advanced));
+    let events_before_stale_gap = {
+        let conn = db(&path);
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events")
+    };
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
+            &history_page("p2", Some("stale"), vec![message("$stale2", 230, "stale2")]),
+            60,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stale));
+    assert_eq!(store.open_gap_positions().unwrap()[0].token, "p3");
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+        events_before_stale_gap,
+        "a stale gap page must not store events"
+    );
+}
+
+#[test]
+fn gap_history_start_closes_only_the_selected_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p0".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+    for (next_batch, prev_batch, at) in [("s2", "p1", 20), ("s3", "p2", 30)] {
+        let mut limited = room_update(ROOM);
+        limited.timeline = vec![message(&format!("$live-{prev_batch}"), 300, "live")];
+        limited.prev_batch = Some(prev_batch.to_owned());
+        limited.limited = true;
+        store
+            .apply_sync_batch(&sync_batch(next_batch, vec![limited]), at)
+            .unwrap();
+    }
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 2);
+
+    // Walking gap 0 back to the start of history closes only that job: the
+    // other gap and the base backfill are untouched.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gaps[0].gap_id),
+            "p1",
+            &history_page("p1", None, vec![message("$start", 1, "start")]),
+            40,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Completed));
+
+    let remaining = store.open_gap_positions().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].gap_id, gaps[1].gap_id);
+    assert_eq!(remaining[0].token, "p2");
+    assert!(!store.room_history_complete(ROOM).unwrap());
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p0")
+    );
+    let conn = db(&path);
+    assert_eq!(
+        conn.query_row(
+            "SELECT close_reason FROM gap_jobs WHERE gap_id = ?1",
+            [gaps[0].gap_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
+        Some("history_start".to_owned())
+    );
+}
+
+#[test]
+fn base_history_completion_does_not_close_open_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
     let mut limited = room_update(ROOM);
     limited.timeline = vec![message("$live2", 300, "live2")];
     limited.prev_batch = Some("p2".to_owned());
@@ -553,24 +989,164 @@ fn reaching_history_start_completes_and_closes_gaps() {
     let outcome = store
         .apply_history_page(
             ROOM,
-            &history_page("p2", None, vec![message("$old", 10, "old")]),
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", None, vec![message("$old", 10, "old")]),
             30,
         )
         .unwrap();
     assert_eq!(outcome.status, Some(HistoryStatus::Completed));
     assert!(store.room_history_complete(ROOM).unwrap());
+    let gaps = store.open_gap_positions().unwrap();
+    assert_eq!(gaps.len(), 1, "base completion must not close gap jobs");
+    assert_eq!(gaps[0].token, "p2");
+}
 
+#[test]
+fn malformed_gap_page_rolls_back_cursor_and_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![limited]), 20)
+        .unwrap();
+    let gap_id = store.open_gap_positions().unwrap()[0].gap_id;
+
+    let error = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
+            &history_page(
+                "p2",
+                Some("p3"),
+                vec![message("$ok", 200, "ok"), json!({"type": "m.room.message"})],
+            ),
+            30,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::MalformedEvent { .. }));
+    assert_eq!(store.open_gap_positions().unwrap()[0].token, "p2");
     let conn = db(&path);
     assert_eq!(
-        scalar_i64(&conn, "SELECT COUNT(*) FROM gap_jobs WHERE status = 'open'"),
-        0
+        scalar_i64(&conn, "SELECT COUNT(*) FROM events"),
+        2,
+        "only the two live events survive the rolled-back gap page"
     );
+}
+
+#[test]
+fn base_stalled_history_token_is_persisted_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![limited]), 20)
+        .unwrap();
+
+    // Empty page returning the same token makes no progress: stall the base
+    // backfill, do not loop, and leave the independent gap untouched.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Base,
+            "p1",
+            &history_page("p1", Some("p1"), vec![]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
     assert_eq!(
-        scalar_string(
-            &conn,
-            "SELECT close_reason FROM gap_jobs WHERE room_id = '!room:hs.example.org'"
-        ),
-        Some("history_start".to_owned())
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+
+    let report = store.status().unwrap();
+    let room = &report.rooms[0];
+    assert!(room.history_stalled);
+    assert_eq!(
+        room.history_error.as_deref(),
+        Some("history pagination returned a repeated token")
+    );
+    assert_eq!(room.open_gaps, 1, "the gap job is independent");
+    assert_eq!(room.unresolved_gaps, 0);
+}
+
+#[test]
+fn repeated_gap_token_unresolves_only_that_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    let mut initial = room_update(ROOM);
+    initial.timeline = vec![message("$live", 100, "live")];
+    initial.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![initial]), 10)
+        .unwrap();
+
+    let mut limited = room_update(ROOM);
+    limited.timeline = vec![message("$live2", 300, "live2")];
+    limited.prev_batch = Some("p2".to_owned());
+    limited.limited = true;
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![limited]), 20)
+        .unwrap();
+    let gap_id = store.open_gap_positions().unwrap()[0].gap_id;
+
+    // A repeated token on a gap job closes only that job: the base backfill is
+    // not stalled and its cursor does not move.
+    let outcome = store
+        .apply_history_page(
+            ROOM,
+            HistoryWork::Gap(gap_id),
+            "p2",
+            &history_page("p2", Some("p2"), vec![]),
+            30,
+        )
+        .unwrap();
+    assert_eq!(outcome.status, Some(HistoryStatus::Stalled));
+    assert!(!store.room_history_stalled(ROOM).unwrap());
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+
+    let report = store.status().unwrap();
+    assert_eq!(report.rooms[0].open_gaps, 0);
+    assert_eq!(report.rooms[0].unresolved_gaps, 1);
+    let conn = db(&path);
+    assert_eq!(
+        conn.query_row(
+            "SELECT close_reason FROM gap_jobs WHERE gap_id = ?1",
+            [gap_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
+        Some("history pagination returned a repeated token".to_owned())
     );
 }
 
@@ -590,6 +1166,8 @@ fn malformed_history_event_rolls_back_page_and_token() {
     let error = store
         .apply_history_page(
             ROOM,
+            HistoryWork::Base,
+            "p1",
             &history_page(
                 "p1",
                 Some("p2"),
