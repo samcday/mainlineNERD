@@ -3,9 +3,9 @@
 //! The live Matrix transport adapter is not part of this checkpoint; `status`
 //! and `export` operate on the durable archive only.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -90,7 +90,7 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
             let store = Store::open_read_only(&cli.db)
                 .with_context(|| format!("opening archive {}", cli.db.display()))?;
             let mut writer: Box<dyn Write> = match &out {
-                Some(path) => Box::new(BufWriter::new(File::create(path)?)),
+                Some(path) => Box::new(BufWriter::new(create_export_file(path)?)),
                 None => Box::new(BufWriter::new(io::stdout().lock())),
             };
             let count = match kind {
@@ -109,4 +109,39 @@ fn execute(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Create the export destination without ever truncating an existing path.
+///
+/// `create_new` refuses files, symlinks (including dangling ones) and hardlink
+/// paths, so the archive and any unrelated file are safe from a stray `--out`.
+/// On Unix the new file is owner-only (`0600`), forced past any umask.
+fn create_export_file(path: &Path) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let file = options.open(path).map_err(|error| {
+        anyhow::anyhow!(
+            "refusing to write export to {}: {error} \
+             (the destination may already exist, be a symlink, or be the archive itself)",
+            path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Apply the mode exactly, even when the process umask masked it.
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+
+    Ok(file)
 }

@@ -108,22 +108,61 @@ not reuse SDK store tables.
 - Projected types: `m.room.message` and `m.room.encrypted` (placeholder with no
   body). Everything else is stored and surfaced but never projected.
 - A valid edit is an `m.room.message` with `m.relates_to.rel_type = m.replace`,
-  an `event_id`, and an `m.new_content.body`. Invalid edits are stored, never
-  projected and never become messages.
+  an `event_id`, and an `m.new_content` carrying at least a `msgtype` and a
+  `body`. Invalid edits are stored, never projected and never become messages.
 - Winning edit: latest by `(origin_server_ts, event_id)` among same-sender,
-  non-redacted edits strictly newer than the original.
+  non-redacted edits, with the event id breaking ties. A replacement is not
+  compared against the original's timestamp, so a sender's clock skew does not
+  discard a later replacement. A missing sender never compares equal to another
+  missing sender.
 - Redaction targets resolve with room-version rules: `content.redacts` for room
   version 11+, the top-level `redacts` field before that, with a fallback when
   only the other field is present.
-- Redacted content is pruned per the room-version redaction rules (for example
-  `m.room.member` keeps `membership`, `m.room.create` keeps its content only in
-  v11+), and the body is removed from both the projection and the stored raw
-  JSON. Redacting an edit falls back to the previous edit or the original body.
+- Redacted content is pruned with ruma-common's maintained redaction algorithm
+  using the room version's `RedactionRules`, and the body is removed from both
+  the projection and the stored raw JSON. The whole envelope is rebuilt, so
+  `content`, `unsigned` aggregations (for example `m.relations` or
+  `prev_content`) and extension fields cannot retain removed text.
+  `unsigned.redacted_because` is reduced to a sanitized provenance marker
+  without any free-form payload. An unknown or malformed room version, or a
+  value canonical JSON cannot represent, fails closed to a provenance-only
+  envelope with empty content instead of returning the original payload.
 - Redactions and edits may arrive before their targets (backward pagination).
   Pending suppression lives in `redactions`, so a body fetched later is stored
   already redacted.
+- Redacting an original suppresses the bodies of its replacement edits, whether
+  the edit was already stored, arrives later during backfill, or the original
+  arrives already redacted. Relation columns are kept text-free so an older
+  replay is recognized and suppressed again. This is a local application
+  retention rule; it does not recall remote federation copies.
 - Already-redacted representations (`unsigned.redacted_because`, empty content
-  for message types) are stored redacted and never projected.
+  for message types) are stored redacted and never projected, applying the same
+  redaction rule as a direct redaction.
+- A replacement cached under `unsigned.m.relations.m.replace` of a plain message
+  is archived as its own event (source `bundle`, keyed by its own event id)
+  through the same store/redaction path when it self-identifies consistently:
+  same room context, same non-missing sender, message type, target equal to the
+  enclosing event, and valid replacement content. Bundles of bundles are never
+  expanded, and an invalid bundle neither alters the original nor becomes a
+  separate claimed message, and a bundle may never reuse the enclosing event's
+  id. Bundle rows are insert-only: a fetched `sync`/`history` event outranks a
+  derived `bundle` for the canonical payload, the first bundle outranks
+  conflicting replays, and a later standalone fetch replaces a bundle-only
+  representation while redaction/suppression state stays monotonic. On that
+  promotion the fetched payload is authoritative: derived relation/edit fields
+  it does not carry are cleared rather than coalesced, and the stale edit's
+  former parent is re-projected. This is canonicalization of duplicated
+  transport metadata, not deletion of independent messages.
+- The opaque server-generated `unsigned` block is never archived verbatim.
+  Relation caches (`unsigned.m.relations`) and `prev_content` are dropped from
+  every stored raw event (a validated bundled replacement is ingested
+  separately), and only a sanitized `redacted_because` marker survives on a
+  redacted representation.
+- Room version, encrypted-room and successor flags are only taken from genuine
+  state events with the expected empty `state_key`; a timeline event merely
+  shaped like `m.room.create`, `m.room.encryption` or `m.room.tombstone` cannot
+  change them. An isolated `m.room.encrypted` timeline event is surfaced as an
+  opaque encrypted event and never enables room-wide E2EE.
 
 ## Privacy and passivity
 
@@ -132,6 +171,14 @@ not reuse SDK store tables.
 - Redaction removes bodies from the raw JSON that is kept, so exports cannot
   resurrect them. Encrypted rooms and room-upgrade successors are flagged for
   operator action instead of being expanded automatically.
+- Raw export is the archived event representation, not a byte-for-byte transport
+  dump. Opaque `unsigned` caches are canonicalized out or ingested as their own
+  bundled events, so removing a replacement also removes every archived copy of
+  its text, including a stale one replayed inside an enclosing original.
+- `export --out` never truncates: the destination is opened with `create_new`
+  and is refused when it already exists as a file, symlink or hardlink path
+  (including the archive itself). A newly created export is owner-only (`0600`)
+  on Unix; `--out` is optional and stdout remains supported.
 
 ## Known limits (this checkpoint)
 
@@ -140,11 +187,16 @@ not reuse SDK store tables.
   (`TransportError::RateLimited { retry_after_ms }`) for the adapter driver.
 - JSONL export is available; no config file/CLI identity plumbing yet. The
   adapter task will add `config.example.toml` and session binding at startup.
-- Edit validity is structural (`m.new_content.body` present) rather than a full
-  ruma re-deserialization; rich HTML sanitization is out of scope.
-- Room version is learned from `m.room.create`; unknown versions fall back to
-  pre-v11 redaction rules with a documented `content.redacts` preference.
+- Edit validity is structural (`m.new_content.msgtype` and `.body` present)
+  rather than a full ruma re-deserialization; rich HTML sanitization is out of
+  scope.
+- Room version is learned from a genuine `m.room.create` state event; redaction
+  uses ruma-common's `RoomVersionRules`, and an unknown or malformed version
+  fails closed to a provenance-only envelope rather than guessing older rules.
 - Stalled rooms are not retried automatically; an operator must clear the
   stall after fixing access (documented, surfaced in `status`).
 - Only forward pagination gaps (limited sync) are modeled; no room-upgrade
   history stitching.
+- Only one level of `unsigned.m.relations.m.replace` bundles is recovered.
+  Deeper or vendor-specific bundles are discarded rather than expanded, and a
+  bundle that does not self-identify consistently is ignored.

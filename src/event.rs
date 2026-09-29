@@ -8,6 +8,10 @@
 //! We deliberately do not implement a Matrix state renderer. Events of unknown
 //! or non-message types are stored verbatim and never projected.
 
+use ruma_common::{
+    canonical_json::{redact, CanonicalJsonObject, CanonicalJsonValue, RedactedBecause},
+    RoomVersionId,
+};
 use serde_json::{Map, Value};
 
 /// Where an event was fetched from.
@@ -15,6 +19,10 @@ use serde_json::{Map, Value};
 pub enum Source {
     Sync,
     History,
+    /// A validated replacement recovered from an enclosing event's
+    /// `unsigned.m.relations.m.replace` bundle. Derived transport metadata, not
+    /// a separately fetched event.
+    Bundle,
 }
 
 impl Source {
@@ -22,6 +30,7 @@ impl Source {
         match self {
             Source::Sync => "sync",
             Source::History => "history",
+            Source::Bundle => "bundle",
         }
     }
 }
@@ -112,6 +121,10 @@ pub struct NormalizedEvent {
     pub encrypted: bool,
     /// Target of `m.room.redaction`, resolved with room-version rules.
     pub redaction_target: Option<String>,
+    /// Validated replacements recovered from this event's
+    /// `unsigned.m.relations.m.replace` bundle, to be stored as their own
+    /// events through the normal path. Bundles of bundles are never expanded.
+    pub bundled_replacements: Vec<NormalizedEvent>,
 }
 
 /// Parse and normalize one wire event.
@@ -121,6 +134,19 @@ pub fn normalize(
     room_version: Option<&str>,
     source: Source,
     received_at: i64,
+) -> Result<NormalizedEvent, EventError> {
+    normalize_inner(room_id, value, room_version, source, received_at, true)
+}
+
+/// Normalize one event. `allow_bundles` is false when normalizing a bundled
+/// replacement itself, so nested bundles are never expanded recursively.
+fn normalize_inner(
+    room_id: &str,
+    value: &Value,
+    room_version: Option<&str>,
+    source: Source,
+    received_at: i64,
+    allow_bundles: bool,
 ) -> Result<NormalizedEvent, EventError> {
     let obj = value.as_object().ok_or(EventError::NotAnObject)?;
     let event_type = obj
@@ -177,14 +203,20 @@ pub fn normalize(
                 match rel_type.as_deref() {
                     Some("m.replace") => {
                         edit_attempt = true;
-                        let new_content = content.get("m.new_content").and_then(Value::as_object);
-                        let new_body = new_content
-                            .and_then(|c| c.get("body"))
-                            .and_then(Value::as_str);
-                        // Valid edits carry both the target and a new text body.
-                        if let (Some(target), Some(new_body)) = (rel_event_id, new_body) {
-                            edit_target = Some(target);
-                            body_text = Some(new_body.to_owned());
+                        // A valid replacement must carry a target and a whole
+                        // message in `m.new_content`, at least `msgtype` and
+                        // `body`, not merely an arbitrary `body`.
+                        if let Some(new_content) =
+                            content.get("m.new_content").and_then(Value::as_object)
+                        {
+                            let new_body = new_content.get("body").and_then(Value::as_str);
+                            let new_msgtype = new_content.get("msgtype").and_then(Value::as_str);
+                            if let (Some(target), Some(new_body), Some(_msgtype)) =
+                                (rel_event_id, new_body, new_msgtype)
+                            {
+                                edit_target = Some(target);
+                                body_text = Some(new_body.to_owned());
+                            }
                         }
                     }
                     Some("m.thread") => {
@@ -229,7 +261,25 @@ pub fn normalize(
     let raw_json = if already_redacted {
         prune_redacted(value, &event_type, room_version)
     } else {
-        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
+        canonical_raw(value)
+    };
+
+    // A replacement cached under `unsigned.m.relations.m.replace` is ingested
+    // as its own event when it self-identifies consistently. Only a direct
+    // bundle of a non-edit message is considered; bundles are never expanded
+    // recursively.
+    let bundled_replacements = if allow_bundles && !edit_attempt {
+        extract_bundled_replacements(
+            room_id,
+            &event_id,
+            &event_type,
+            sender.as_deref(),
+            obj,
+            room_version,
+            received_at,
+        )
+    } else {
+        Vec::new()
     };
 
     Ok(NormalizedEvent {
@@ -251,7 +301,86 @@ pub fn normalize(
         redacted: already_redacted,
         encrypted: false,
         redaction_target,
+        bundled_replacements,
     })
+}
+
+/// Serialize an unredacted event for the archive after dropping the opaque
+/// server-generated `unsigned` block. Raw export is the archived event
+/// representation, not a byte-for-byte transport dump: relation caches
+/// (`unsigned.m.relations`, `unsigned.prev_content`) are either ingested as
+/// their own events or discarded, never duplicated inside the parent.
+fn canonical_raw(value: &Value) -> String {
+    match value.as_object() {
+        Some(object) => {
+            let mut archived = object.clone();
+            archived.remove("unsigned");
+            Value::Object(archived).to_string()
+        }
+        None => "{}".to_owned(),
+    }
+}
+
+/// Validate and recover a replacement bundled under
+/// `unsigned.m.relations.m.replace` of a plain message.
+///
+/// A bundle is accepted only when it identifies itself consistently: the
+/// enclosing event is a message with a non-missing sender, the bundle shares
+/// that sender and (if present) the room, and normalizing it with the same
+/// rules yields a valid `m.replace` whose target is the enclosing event. Any
+/// other bundle is dropped and changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn extract_bundled_replacements(
+    room_id: &str,
+    event_id: &str,
+    event_type: &str,
+    sender: Option<&str>,
+    obj: &Map<String, Value>,
+    room_version: Option<&str>,
+    received_at: i64,
+) -> Vec<NormalizedEvent> {
+    if event_type != MESSAGE || sender.is_none() {
+        return Vec::new();
+    }
+    let Some(bundle) = obj
+        .get("unsigned")
+        .and_then(Value::as_object)
+        .and_then(|unsigned| unsigned.get("m.relations"))
+        .and_then(Value::as_object)
+        .and_then(|relations| relations.get("m.replace"))
+    else {
+        return Vec::new();
+    };
+    let Some(bundle_object) = bundle.as_object() else {
+        return Vec::new();
+    };
+    // A `room_id` that is present must match exactly. A non-string value is
+    // invalid, not equivalent to an absent field.
+    if let Some(room_field) = bundle_object.get("room_id") {
+        if room_field.as_str() != Some(room_id) {
+            return Vec::new();
+        }
+    }
+    if bundle_object.get("sender").and_then(Value::as_str) != sender {
+        return Vec::new();
+    }
+    let Ok(bundled) = normalize_inner(
+        room_id,
+        bundle,
+        room_version,
+        Source::Bundle,
+        received_at,
+        false,
+    ) else {
+        return Vec::new();
+    };
+    // The bundle must be a distinct event replacing the enclosing one. A
+    // derived cache may never claim the enclosing event's identity, or it
+    // would later be applied over the original it belongs to.
+    if bundled.event_id == event_id || bundled.edit_target.as_deref() != Some(event_id) {
+        return Vec::new();
+    }
+    vec![bundled]
 }
 
 /// Resolve the target of an `m.room.redaction` event using room-version rules.
@@ -288,118 +417,97 @@ fn version_major(room_version: Option<&str>) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// The room-version dependent parts of the redaction algorithm we apply.
-struct RedactionFlags {
-    keep_room_aliases_aliases: bool,
-    keep_room_join_rules_allow: bool,
-    keep_room_member_join_authorised_via_users_server: bool,
-    keep_room_member_third_party_invite_signed: bool,
-    keep_room_create_content: bool,
-    keep_room_redaction_redacts: bool,
-    keep_room_power_levels_invite: bool,
-}
-
-fn redaction_flags(room_version: Option<&str>) -> RedactionFlags {
-    let major = version_major(room_version).unwrap_or(1);
-    RedactionFlags {
-        keep_room_aliases_aliases: major < 6,
-        keep_room_join_rules_allow: major >= 8,
-        keep_room_member_join_authorised_via_users_server: major >= 9,
-        keep_room_member_third_party_invite_signed: major >= 11,
-        keep_room_create_content: major >= 11,
-        keep_room_redaction_redacts: major >= 11,
-        keep_room_power_levels_invite: major >= 11,
-    }
-}
-
-fn keep(content: &Map<String, Value>, keys: &[&str]) -> Value {
-    let mut out = Map::new();
-    for key in keys {
-        if let Some(value) = content.get(*key) {
-            out.insert((*key).to_owned(), value.clone());
-        }
-    }
-    Value::Object(out)
-}
-
-/// Prune a redacted event's content down to the fields the spec preserves for
-/// its type and room version, then serialize the event. This is what removes
-/// bodies from the raw JSON we keep.
+/// Prune a redacted event down to the envelope and content the Matrix
+/// redaction algorithm preserves for its type and room version, then serialize
+/// the event. This is what removes bodies from the raw JSON we keep.
+///
+/// Unknown or malformed room versions and values that cannot be represented as
+/// canonical JSON fail closed to a provenance-only envelope with empty
+/// content: the original payload is never returned.
 pub fn prune_redacted(value: &Value, event_type: &str, room_version: Option<&str>) -> String {
-    let Some(obj) = value.as_object() else {
-        return value.to_string();
-    };
-    let flags = redaction_flags(room_version);
-    let content = obj.get("content").and_then(Value::as_object);
-
-    let redacted_content = match (event_type, content) {
-        (_, None) => Value::Object(Map::new()),
-        ("m.room.member", Some(content)) => {
-            let mut keys = vec!["membership"];
-            if flags.keep_room_member_join_authorised_via_users_server {
-                keys.push("join_authorised_via_users_server");
-            }
-            let mut pruned = keep(content, &keys);
-            if flags.keep_room_member_third_party_invite_signed {
-                if let Some(signed) = content
-                    .get("third_party_invite")
-                    .and_then(Value::as_object)
-                    .and_then(|t| t.get("signed"))
-                {
-                    let mut third_party = Map::new();
-                    third_party.insert("signed".to_owned(), signed.clone());
-                    if let Value::Object(ref mut pruned) = pruned {
-                        pruned.insert("third_party_invite".to_owned(), Value::Object(third_party));
-                    }
-                }
-            }
-            pruned
-        }
-        ("m.room.create", Some(content)) if flags.keep_room_create_content => {
-            Value::Object(content.clone())
-        }
-        ("m.room.create", Some(content)) => keep(content, &["creator"]),
-        ("m.room.join_rules", Some(content)) => {
-            let mut keys = vec!["join_rule"];
-            if flags.keep_room_join_rules_allow {
-                keys.push("allow");
-            }
-            keep(content, &keys)
-        }
-        ("m.room.power_levels", Some(content)) => {
-            let mut keys = vec![
-                "ban",
-                "events",
-                "events_default",
-                "kick",
-                "redact",
-                "state_default",
-                "users",
-                "users_default",
-            ];
-            if flags.keep_room_power_levels_invite {
-                keys.push("invite");
-            }
-            keep(content, &keys)
-        }
-        ("m.room.history_visibility", Some(content)) => keep(content, &["history_visibility"]),
-        ("m.room.aliases", Some(content)) if flags.keep_room_aliases_aliases => {
-            keep(content, &["aliases"])
-        }
-        ("m.room.redaction", Some(content)) if flags.keep_room_redaction_redacts => {
-            keep(content, &["redacts"])
-        }
-        _ => Value::Object(Map::new()),
-    };
-
-    let mut pruned = obj.clone();
-    pruned.insert("content".to_owned(), redacted_content);
-    if version_major(room_version).is_some_and(|major| major >= 11) {
-        pruned.remove("origin");
-        pruned.remove("membership");
-        pruned.remove("prev_state");
+    match redact_with_rules(value, room_version) {
+        Some(redacted) => Value::from(redacted).to_string(),
+        None => strict_redacted_envelope(value, event_type).to_string(),
     }
-    Value::Object(pruned).to_string()
+}
+
+/// Apply ruma-common's maintained redaction algorithm with the rules of the
+/// room version. Returns `None` for unknown or unparseable versions, for
+/// non-object events, for values canonical JSON cannot represent (for example
+/// floats) or for a payload ruma rejects, so the caller can fail closed.
+fn redact_with_rules(value: &Value, room_version: Option<&str>) -> Option<CanonicalJsonValue> {
+    let version: RoomVersionId = room_version?.parse().ok()?;
+    let rules = version.rules()?.redaction;
+    let object = canonical_object(value)?;
+    let redacted_because = value
+        .get("unsigned")
+        .and_then(Value::as_object)
+        .and_then(|unsigned| unsigned.get("redacted_because"))
+        .and_then(|because| canonical_object(&sanitize_redacted_because(because)))
+        .map(RedactedBecause::from_json);
+    let redacted = redact(object, &rules, redacted_because).ok()?;
+    Some(CanonicalJsonValue::Object(redacted))
+}
+
+/// Convert a JSON value to a canonical JSON object, or `None` when it is not an
+/// object or cannot be represented in canonical JSON.
+fn canonical_object(value: &Value) -> Option<CanonicalJsonObject> {
+    match CanonicalJsonValue::try_from(value.clone()).ok()? {
+        CanonicalJsonValue::Object(object) => Some(object),
+        _ => None,
+    }
+}
+
+/// Keep only an object marker and identifier provenance from a
+/// `unsigned.redacted_because` value. Arbitrary payload (for example a
+/// redaction `reason` or nested relations) is never carried forward.
+fn sanitize_redacted_because(because: &Value) -> Value {
+    let Some(object) = because.as_object() else {
+        return Value::Object(Map::new());
+    };
+    let mut sanitized = Map::new();
+    for key in ["type", "event_id", "sender"] {
+        if let Some(field) = object.get(key).and_then(Value::as_str) {
+            sanitized.insert(key.to_owned(), Value::String(field.to_owned()));
+        }
+    }
+    if let Some(ts) = object.get("origin_server_ts").and_then(Value::as_i64) {
+        sanitized.insert("origin_server_ts".to_owned(), Value::Number(ts.into()));
+    }
+    Value::Object(sanitized)
+}
+
+/// A provenance-only redacted envelope used when the room version is unknown or
+/// the event cannot be canonicalized: event identity and sender survive, content
+/// is emptied and every other field is dropped.
+fn strict_redacted_envelope(value: &Value, event_type: &str) -> Value {
+    let Some(object) = value.as_object() else {
+        return Value::Object(Map::new());
+    };
+    let mut envelope = Map::new();
+    envelope.insert("type".to_owned(), Value::String(event_type.to_owned()));
+    for key in ["event_id", "room_id", "sender", "state_key"] {
+        if let Some(field) = object.get(key).and_then(Value::as_str) {
+            envelope.insert(key.to_owned(), Value::String(field.to_owned()));
+        }
+    }
+    if let Some(ts) = object.get("origin_server_ts").and_then(Value::as_i64) {
+        envelope.insert("origin_server_ts".to_owned(), Value::Number(ts.into()));
+    }
+    envelope.insert("content".to_owned(), Value::Object(Map::new()));
+    if let Some(because) = object
+        .get("unsigned")
+        .and_then(Value::as_object)
+        .and_then(|unsigned| unsigned.get("redacted_because"))
+    {
+        let mut unsigned = Map::new();
+        unsigned.insert(
+            "redacted_because".to_owned(),
+            sanitize_redacted_because(because),
+        );
+        envelope.insert("unsigned".to_owned(), Value::Object(unsigned));
+    }
+    Value::Object(envelope)
 }
 
 #[cfg(test)]
@@ -506,5 +614,267 @@ mod tests {
         let ev = normalize("!r:example.org", &value, None, Source::History, 1).unwrap();
         assert!(ev.redacted);
         assert!(ev.body_text.is_none());
+    }
+
+    #[test]
+    fn replacement_without_msgtype_is_not_valid() {
+        let value = json!({
+            "type": "m.room.message",
+            "event_id": "$edit",
+            "sender": "@a:example.org",
+            "origin_server_ts": 20,
+            "content": {
+                "msgtype": "m.text",
+                "body": "* no msgtype",
+                "m.new_content": { "body": "no msgtype" },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig" }
+            }
+        });
+        let ev = normalize("!r:example.org", &value, Some("11"), Source::Sync, 1).unwrap();
+        assert!(ev.edit_attempt);
+        assert_eq!(
+            ev.edit_target, None,
+            "no msgtype means no valid replacement"
+        );
+    }
+
+    #[test]
+    fn pruning_drops_unsigned_relations_prev_content_and_extensions() {
+        let value = json!({
+            "type": "m.room.message",
+            "event_id": "$edit",
+            "room_id": "!r:example.org",
+            "sender": "@a:example.org",
+            "origin_server_ts": 7,
+            "content": {
+                "msgtype": "m.text",
+                "body": "* hidden edit",
+                "m.new_content": { "msgtype": "m.text", "body": "hidden edit" },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig" }
+            },
+            "unsigned": {
+                "m.relations": {
+                    "m.replace": { "event_id": "$edit", "content": { "body": "hidden aggregate" } }
+                },
+                "prev_content": { "body": "hidden previous" }
+            },
+            "arbitrary_extension": { "note": "hidden extension" }
+        });
+        let pruned = prune_redacted(&value, "m.room.message", Some("11"));
+        assert!(!pruned.contains("hidden"), "removed text leaked: {pruned}");
+        let parsed: Value = serde_json::from_str(&pruned).unwrap();
+        assert!(parsed.get("unsigned").is_none());
+        assert!(parsed.get("arbitrary_extension").is_none());
+        assert_eq!(parsed["event_id"], "$edit");
+        assert_eq!(parsed["sender"], "@a:example.org");
+        assert_eq!(parsed["content"], json!({}));
+    }
+
+    #[test]
+    fn pruning_sanitizes_redacted_because_payload() {
+        let value = json!({
+            "type": "m.room.message",
+            "event_id": "$m",
+            "room_id": "!r:example.org",
+            "content": {},
+            "unsigned": {
+                "redacted_because": {
+                    "type": "m.room.redaction",
+                    "event_id": "$red",
+                    "sender": "@mod:example.org",
+                    "content": { "reason": "secret reason" }
+                }
+            }
+        });
+        let pruned = prune_redacted(&value, "m.room.message", Some("11"));
+        assert!(!pruned.contains("secret reason"), "reason leaked: {pruned}");
+        let parsed: Value = serde_json::from_str(&pruned).unwrap();
+        assert_eq!(
+            parsed["unsigned"]["redacted_because"]["type"],
+            "m.room.redaction"
+        );
+        assert_eq!(parsed["unsigned"]["redacted_because"]["event_id"], "$red");
+        assert!(parsed["unsigned"]["redacted_because"]
+            .get("content")
+            .is_none());
+        assert_eq!(parsed["event_id"], "$m");
+    }
+
+    #[test]
+    fn pruning_fails_closed_for_unknown_room_version() {
+        let value = json!({
+            "type": "m.room.message",
+            "event_id": "$m",
+            "room_id": "!r:example.org",
+            "sender": "@a:example.org",
+            "origin_server_ts": 5,
+            "content": { "msgtype": "m.text", "body": "secret body" },
+            "unsigned": {
+                "m.relations": { "m.replace": { "content": { "body": "secret aggregate" } } }
+            }
+        });
+        let pruned = prune_redacted(&value, "m.room.message", Some("org.example.custom"));
+        assert!(!pruned.contains("secret"), "removed text leaked: {pruned}");
+        let parsed: Value = serde_json::from_str(&pruned).unwrap();
+        assert_eq!(parsed["type"], "m.room.message");
+        assert_eq!(parsed["event_id"], "$m");
+        assert_eq!(parsed["sender"], "@a:example.org");
+        assert_eq!(parsed["origin_server_ts"], 5);
+        assert_eq!(parsed["content"], json!({}));
+        assert!(parsed.get("unsigned").is_none());
+    }
+
+    #[test]
+    fn bundled_replacement_is_validated_and_unsigned_is_stripped() {
+        let value = json!({
+            "type": "m.room.message",
+            "event_id": "$orig",
+            "room_id": "!r:example.org",
+            "sender": "@a:example.org",
+            "origin_server_ts": 5,
+            "content": { "msgtype": "m.text", "body": "original body" },
+            "unsigned": {
+                "m.relations": {
+                    "m.replace": {
+                        "type": "m.room.message",
+                        "event_id": "$bundle",
+                        "sender": "@a:example.org",
+                        "room_id": "!r:example.org",
+                        "origin_server_ts": 6,
+                        "content": {
+                            "msgtype": "m.text",
+                            "body": "* bundled body",
+                            "m.new_content": { "msgtype": "m.text", "body": "bundled body" },
+                            "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig" }
+                        },
+                        "unsigned": {
+                            "m.relations": {
+                                "m.replace": {
+                                    "type": "m.room.message",
+                                    "event_id": "$nested",
+                                    "sender": "@a:example.org",
+                                    "content": {
+                                        "msgtype": "m.text",
+                                        "body": "* nested body",
+                                        "m.new_content": { "msgtype": "m.text", "body": "nested body" },
+                                        "m.relates_to": { "rel_type": "m.replace", "event_id": "$bundle" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let ev = normalize("!r:example.org", &value, Some("11"), Source::Sync, 1).unwrap();
+        assert_eq!(ev.bundled_replacements.len(), 1);
+        let bundled = &ev.bundled_replacements[0];
+        assert_eq!(bundled.event_id, "$bundle");
+        assert_eq!(bundled.source, Source::Bundle);
+        assert_eq!(bundled.edit_target.as_deref(), Some("$orig"));
+        assert_eq!(bundled.body_text.as_deref(), Some("bundled body"));
+        assert!(bundled.bundled_replacements.is_empty());
+        assert!(!ev.raw_json.contains("bundled body"));
+        assert!(!ev.raw_json.contains("nested body"));
+        assert!(!ev.raw_json.contains("m.relations"));
+        assert!(!bundled.raw_json.contains("nested body"));
+        assert!(!bundled.raw_json.contains("m.relations"));
+    }
+
+    #[test]
+    fn invalid_bundle_is_not_exposed_as_a_replacement() {
+        let value = json!({
+            "type": "m.room.message",
+            "event_id": "$orig",
+            "room_id": "!r:example.org",
+            "sender": "@a:example.org",
+            "content": { "msgtype": "m.text", "body": "original body" },
+            "unsigned": {
+                "m.relations": {
+                    "m.replace": {
+                        "type": "m.room.message",
+                        "event_id": "$bundle",
+                        "sender": "@b:example.org",
+                        "content": {
+                            "msgtype": "m.text",
+                            "body": "* bundled body",
+                            "m.new_content": { "msgtype": "m.text", "body": "bundled body" },
+                            "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig" }
+                        }
+                    }
+                }
+            }
+        });
+        let ev = normalize("!r:example.org", &value, Some("11"), Source::Sync, 1).unwrap();
+        assert!(ev.bundled_replacements.is_empty());
+        assert!(!ev.raw_json.contains("bundled body"));
+        assert!(!ev.raw_json.contains("m.relations"));
+    }
+
+    #[test]
+    fn bundle_identity_collision_and_non_string_room_are_rejected() {
+        let parent = |bundle: Value| -> Value {
+            json!({
+                "type": "m.room.message",
+                "event_id": "$orig",
+                "room_id": "!r:example.org",
+                "sender": "@a:example.org",
+                "content": { "msgtype": "m.text", "body": "original body" },
+                "unsigned": { "m.relations": { "m.replace": bundle } }
+            })
+        };
+        let base = |id: &str| -> Value {
+            json!({
+                "type": "m.room.message",
+                "event_id": id,
+                "sender": "@a:example.org",
+                "origin_server_ts": 6,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "* bundled body",
+                    "m.new_content": { "msgtype": "m.text", "body": "bundled body" },
+                    "m.relates_to": { "rel_type": "m.replace", "event_id": "$orig" }
+                }
+            })
+        };
+
+        // A bundle may not claim the enclosing event's identity.
+        let ev = normalize(
+            "!r:example.org",
+            &parent(base("$orig")),
+            Some("11"),
+            Source::Sync,
+            1,
+        )
+        .unwrap();
+        assert!(ev.bundled_replacements.is_empty());
+        assert!(!ev.raw_json.contains("bundled body"));
+
+        // A present non-string `room_id` is invalid, not absent.
+        let mut typed_room = base("$bundle");
+        typed_room["room_id"] = json!(42);
+        let ev = normalize(
+            "!r:example.org",
+            &parent(typed_room),
+            Some("11"),
+            Source::Sync,
+            1,
+        )
+        .unwrap();
+        assert!(ev.bundled_replacements.is_empty());
+        assert!(!ev.raw_json.contains("bundled body"));
+
+        // A matching string `room_id` is still accepted.
+        let mut matching_room = base("$bundle");
+        matching_room["room_id"] = json!("!r:example.org");
+        let ev = normalize(
+            "!r:example.org",
+            &parent(matching_room),
+            Some("11"),
+            Source::Sync,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ev.bundled_replacements.len(), 1);
     }
 }

@@ -115,6 +115,42 @@ pub fn redaction(id: &str, ts: i64, target: &str, v11: bool) -> Value {
     }
 }
 
+/// A plain message carrying a valid replacement under
+/// `unsigned.m.relations.m.replace`. The bundle is transport metadata, not a
+/// separately fetched event.
+pub fn message_with_bundled_edit(
+    id: &str,
+    ts: i64,
+    body: &str,
+    edit_id: &str,
+    edit_ts: i64,
+    new_body: &str,
+) -> Value {
+    json!({
+        "type": "m.room.message",
+        "event_id": id,
+        "sender": ALICE,
+        "origin_server_ts": ts,
+        "content": { "msgtype": "m.text", "body": body },
+        "unsigned": {
+            "m.relations": {
+                "m.replace": {
+                    "type": "m.room.message",
+                    "event_id": edit_id,
+                    "sender": ALICE,
+                    "origin_server_ts": edit_ts,
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": format!("* {new_body}"),
+                        "m.new_content": { "msgtype": "m.text", "body": new_body },
+                        "m.relates_to": { "rel_type": "m.replace", "event_id": id }
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn already_redacted_message(id: &str, ts: i64) -> Value {
     json!({
         "type": "m.room.message",

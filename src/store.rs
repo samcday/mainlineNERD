@@ -982,7 +982,6 @@ fn normalize_homeserver(input: &str) -> String {
 
 #[derive(Debug, Clone)]
 struct EventRow {
-    event_id: String,
     event_type: String,
     sender: Option<String>,
     origin_server_ts: Option<i64>,
@@ -993,6 +992,7 @@ struct EventRow {
     relation_type: Option<String>,
     relates_to_event_id: Option<String>,
     thread_root_id: Option<String>,
+    source: String,
 }
 
 fn normalize_event(
@@ -1055,23 +1055,23 @@ fn get_event_row(
 ) -> Result<Option<EventRow>, StoreError> {
     Ok(conn
         .query_row(
-            "SELECT event_id, event_type, sender, origin_server_ts, body_text, edit_target, redacted,
-                    redacted_at, relation_type, relates_to_event_id, thread_root_id
+            "SELECT event_type, sender, origin_server_ts, body_text, edit_target, redacted,
+                    redacted_at, relation_type, relates_to_event_id, thread_root_id, source
              FROM events WHERE room_id = ?1 AND event_id = ?2",
             params![room_id, event_id],
             |row| {
                 Ok(EventRow {
-                    event_id: row.get(0)?,
-                    event_type: row.get(1)?,
-                    sender: row.get(2)?,
-                    origin_server_ts: row.get(3)?,
-                    body_text: row.get(4)?,
-                    edit_target: row.get(5)?,
-                    redacted: row.get(6)?,
-                    redacted_at: row.get(7)?,
-                    relation_type: row.get(8)?,
-                    relates_to_event_id: row.get(9)?,
-                    thread_root_id: row.get(10)?,
+                    event_type: row.get(0)?,
+                    sender: row.get(1)?,
+                    origin_server_ts: row.get(2)?,
+                    body_text: row.get(3)?,
+                    edit_target: row.get(4)?,
+                    redacted: row.get(5)?,
+                    redacted_at: row.get(6)?,
+                    relation_type: row.get(7)?,
+                    relates_to_event_id: row.get(8)?,
+                    thread_root_id: row.get(9)?,
+                    source: row.get(10)?,
                 })
             },
         )
@@ -1098,6 +1098,14 @@ fn apply_sync_room(
         let Some(event_type) = obj.get("type").and_then(Value::as_str) else {
             continue;
         };
+        // Room policy is derived only from state events: the type alone is not
+        // enough, the expected empty `state_key` must be present. A plain
+        // timeline event bearing one of these types is not a state change, and
+        // an isolated `m.room.encrypted` payload never enables room-wide E2EE.
+        let is_state = obj.get("state_key").and_then(Value::as_str) == Some("");
+        if !is_state {
+            continue;
+        }
         match event_type {
             event::ROOM_CREATE => {
                 if let Some(content) = obj.get("content").and_then(Value::as_object) {
@@ -1113,7 +1121,7 @@ fn apply_sync_room(
                         .or(predecessor_room_id);
                 }
             }
-            event::ROOM_ENCRYPTION | event::ENCRYPTED => encrypted = true,
+            event::ROOM_ENCRYPTION => encrypted = true,
             event::ROOM_TOMBSTONE => {
                 successor_room_id = obj
                     .get("content")
@@ -1262,6 +1270,25 @@ fn store_event(
 ) -> Result<bool, StoreError> {
     let prior = get_event_row(conn, &event.room_id, &event.event_id)?;
     let prior_exists = prior.is_some();
+
+    // Derived bundle caches are insert-only: they never rewrite an existing
+    // row's canonical payload. A fetched event (sync/history) is authoritative
+    // over a bundle, and the first bundle wins over conflicting replays. A
+    // later standalone fetch still replaces a bundle-only representation
+    // through the normal upsert below, keeping redaction/suppression state
+    // monotonic (prior redaction is folded into `redacted`).
+    if event.source == Source::Bundle && prior_exists {
+        return Ok(true);
+    }
+
+    // Promotion: a fetched standalone event replacing a derived bundle-only
+    // row. The fetched payload becomes authoritative, so derived relation/edit
+    // fields that it does not carry are cleared rather than coalesced, and the
+    // stale edit's former parent is re-projected.
+    let prior_is_bundle = prior
+        .as_ref()
+        .is_some_and(|p| p.source == Source::Bundle.as_str());
+    let promotion = prior_is_bundle && event.source != Source::Bundle;
     let prior_edit_parent = prior.as_ref().and_then(|p| p.edit_target.clone());
 
     let pending_redaction: Option<(String, Option<i64>, i64)> = conn
@@ -1275,7 +1302,17 @@ fn store_event(
         .optional()?;
 
     let prior_redacted = prior.as_ref().map(|p| p.redacted).unwrap_or(false);
-    let redacted = event.redacted || prior_redacted || pending_redaction.is_some();
+    // A replacement whose original has been redacted (directly, through a
+    // pending redaction, or because the original arrived already redacted) is
+    // suppressed as well, even though no redaction names the replacement.
+    let replacement_target_redacted = match &event.edit_target {
+        Some(target) => target_is_redacted(conn, &event.room_id, target)?,
+        None => false,
+    };
+    let redacted = event.redacted
+        || prior_redacted
+        || pending_redaction.is_some()
+        || replacement_target_redacted;
 
     let raw_json = if redacted {
         if event.redacted {
@@ -1316,13 +1353,19 @@ fn store_event(
             origin_server_ts = COALESCE(excluded.origin_server_ts, events.origin_server_ts),
             received_at = MIN(events.received_at, excluded.received_at),
             last_seen_at = excluded.last_seen_at,
+            source = CASE WHEN events.source = 'bundle' THEN excluded.source ELSE events.source END,
             raw_json = excluded.raw_json,
             body_text = excluded.body_text,
-            relation_type = COALESCE(excluded.relation_type, events.relation_type),
-            relates_to_event_id = COALESCE(excluded.relates_to_event_id, events.relates_to_event_id),
-            edit_target = COALESCE(excluded.edit_target, events.edit_target),
-            edit_attempt = MAX(events.edit_attempt, excluded.edit_attempt),
-            thread_root_id = COALESCE(excluded.thread_root_id, events.thread_root_id),
+            relation_type = CASE WHEN events.source = 'bundle'
+                THEN excluded.relation_type ELSE COALESCE(excluded.relation_type, events.relation_type) END,
+            relates_to_event_id = CASE WHEN events.source = 'bundle'
+                THEN excluded.relates_to_event_id ELSE COALESCE(excluded.relates_to_event_id, events.relates_to_event_id) END,
+            edit_target = CASE WHEN events.source = 'bundle'
+                THEN excluded.edit_target ELSE COALESCE(excluded.edit_target, events.edit_target) END,
+            edit_attempt = CASE WHEN events.source = 'bundle'
+                THEN excluded.edit_attempt ELSE MAX(events.edit_attempt, excluded.edit_attempt) END,
+            thread_root_id = CASE WHEN events.source = 'bundle'
+                THEN excluded.thread_root_id ELSE COALESCE(excluded.thread_root_id, events.thread_root_id) END,
             redacted = excluded.redacted,
             redacted_by = COALESCE(excluded.redacted_by, events.redacted_by),
             redacted_at = COALESCE(excluded.redacted_at, events.redacted_at),
@@ -1351,6 +1394,15 @@ fn store_event(
         ],
     )?;
 
+    // Whenever a redacted message original is stored (a plain redaction
+    // arriving later, a pending redaction finally finding its target, or an
+    // already-redacted representation), suppress any replacement edits that
+    // already point at it. This keeps their bodies out of the archive even
+    // when the edit was seen before the redaction.
+    if redacted && event::is_message_type(&event.event_type) && !event.edit_attempt {
+        suppress_replacement_bodies(conn, &event.room_id, &event.event_id, received_at)?;
+    }
+
     let mut refresh: Vec<String> = Vec::new();
     if event.event_type == event::REDACTION {
         if let Some(target) = &event.redaction_target {
@@ -1361,6 +1413,9 @@ fn store_event(
                 params![event.room_id, target, event.event_id, event.origin_server_ts, received_at],
             )?;
             mark_redacted(conn, &event.room_id, target, &event.event_id, received_at)?;
+            // Suppress edits even when the target event itself has not been
+            // fetched yet; the redactions row is authoritative.
+            suppress_replacement_bodies(conn, &event.room_id, target, received_at)?;
             refresh.push(target.clone());
             if let Some(parent) = target_row.and_then(|row| row.edit_target) {
                 refresh.push(parent);
@@ -1370,7 +1425,7 @@ fn store_event(
     if let Some(target) = &event.edit_target {
         refresh.push(target.clone());
     }
-    if event.redacted {
+    if event.redacted || promotion {
         if let Some(parent) = prior_edit_parent {
             refresh.push(parent);
         }
@@ -1383,6 +1438,13 @@ fn store_event(
     refresh.dedup();
     for target in refresh {
         project_event(conn, &event.room_id, &target, received_at)?;
+    }
+
+    // Store validated bundled replacements through the same event path, keyed
+    // by their own event id. They are plain edits: redaction state, target
+    // suppression and replay idempotence all apply unchanged.
+    for bundled in &event.bundled_replacements {
+        store_event(conn, bundled, received_at)?;
     }
     Ok(prior_exists)
 }
@@ -1412,6 +1474,63 @@ fn mark_redacted(
                     redacted_at = COALESCE(redacted_at, ?5)
              WHERE room_id = ?1 AND event_id = ?2",
             params![room_id, target, pruned, redaction_event_id, at],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `target` is known to be redacted in `room_id`: either its stored row
+/// is redacted or a redaction naming it is recorded (possibly before the target
+/// itself was fetched). Strictly room-scoped, so equal event ids in different
+/// rooms never leak into each other.
+fn target_is_redacted(conn: &Connection, room_id: &str, target: &str) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM events WHERE room_id = ?1 AND event_id = ?2 AND redacted = 1
+             UNION ALL
+             SELECT 1 FROM redactions WHERE room_id = ?1 AND target_event_id = ?2
+             LIMIT 1",
+            params![room_id, target],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Suppress the bodies of every replacement edit that targets a redacted
+/// original. The edit rows keep their relation columns, so an older replay of
+/// the edit is recognized and suppressed again instead of restoring the text.
+/// This is our local application retention rule; it cannot and does not recall
+/// remote federation copies.
+fn suppress_replacement_bodies(
+    conn: &Connection,
+    room_id: &str,
+    original_event_id: &str,
+    at: i64,
+) -> Result<(), StoreError> {
+    let version = room_version(conn, room_id)?;
+    let edits: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT event_id, event_type, raw_json FROM events
+             WHERE room_id = ?1 AND edit_target = ?2 AND redacted = 0",
+        )?;
+        let rows = stmt.query_map(params![room_id, original_event_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut edits = Vec::new();
+        for row in rows {
+            edits.push(row?);
+        }
+        edits
+    };
+    for (event_id, event_type, raw_json) in edits {
+        let value: Value = serde_json::from_str(&raw_json).unwrap_or(Value::Null);
+        let pruned = event::prune_redacted(&value, &event_type, version.as_deref());
+        conn.execute(
+            "UPDATE events SET redacted = 1, body_text = NULL, raw_json = ?3,
+                    redacted_at = COALESCE(redacted_at, ?4)
+             WHERE room_id = ?1 AND event_id = ?2 AND redacted = 0",
+            params![room_id, event_id, pruned, at],
         )?;
     }
     Ok(())
@@ -1490,29 +1609,30 @@ fn project_event(
         return Ok(());
     }
 
-    // Pick the latest valid edit by (origin_server_ts, event_id). Only edits
-    // from the same sender that are newer than the original win.
-    let best_edit: Option<(String, i64, String)> = conn
+    // Pick the latest valid replacement among replacements by
+    // (origin_server_ts, event_id), with the event id breaking ties. The
+    // replacement is never compared against the original's timestamp: a
+    // sender's clock may lag, but a later replacement is still authoritative.
+    // A missing sender must not match another missing sender, so only a
+    // non-null sender equal to the original's is accepted.
+    let best_edit: Option<(String, String)> = conn
         .query_row(
-            "SELECT event_id, COALESCE(origin_server_ts, 0), body_text FROM events
+            "SELECT event_id, body_text FROM events
              WHERE room_id = ?1 AND event_type = ?2 AND edit_target = ?3 AND redacted = 0
-               AND body_text IS NOT NULL AND sender IS ?4
+               AND body_text IS NOT NULL AND sender IS NOT NULL AND sender = ?4
                AND NOT EXISTS (
                    SELECT 1 FROM redactions r
                    WHERE r.room_id = events.room_id AND r.target_event_id = events.event_id
                )
              ORDER BY COALESCE(origin_server_ts, 0) DESC, event_id DESC LIMIT 1",
             params![room_id, event::MESSAGE, event_id, event.sender.as_deref()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
 
-    let original_key = (event.origin_server_ts.unwrap_or(0), event.event_id.clone());
     let (body, latest_edit_event_id) = match best_edit {
-        Some((edit_id, edit_ts, edit_body)) if (edit_ts, edit_id.clone()) > original_key => {
-            (Some(edit_body), Some(edit_id))
-        }
-        _ => (event.body_text.clone(), None),
+        Some((edit_id, edit_body)) => (Some(edit_body), Some(edit_id)),
+        None => (event.body_text.clone(), None),
     };
 
     upsert_projection(
