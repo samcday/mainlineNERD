@@ -9,7 +9,8 @@
 homeserver = "https://matrix.example.org"
 
 # The exact account/device this archive is bound to. A token whose /whoami
-# identity differs is refused before any ingestion.
+# identity differs is refused before any ingestion. Device ids are opaque:
+# this value is compared exactly, so whitespace is significant.
 user_id = "@mainlinenerd:example.org"
 device_id = "MLN-INGEST"
 

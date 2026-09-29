@@ -747,15 +747,22 @@ async fn bootstrap_versions_resolve_pre_v11_and_v11_redaction_targets() {
     transport.allow_room(ROOM.parse().unwrap());
     transport.allow_room(ROOM2.parse().unwrap());
 
-    // Seed base cursors, then feed a redaction through the typed /messages path.
-    for room in [ROOM, ROOM2] {
-        let mut update = room_update(room);
-        update.timeline = vec![message("$live", "live")];
-        update.prev_batch = Some("p1".to_owned());
-        store
-            .apply_sync_batch(&sync_batch("s1", vec![update]), 10)
-            .unwrap();
-    }
+    // Seed base cursors, then feed a redaction through the typed /messages
+    // path. Both rooms carry their own `prev_batch` in one batch, as a real
+    // `/sync` would, so each pins its own cursor before the committed global
+    // token can seed any never-started room.
+    let updates = [ROOM, ROOM2]
+        .into_iter()
+        .map(|room| {
+            let mut update = room_update(room);
+            update.timeline = vec![message("$live", "live")];
+            update.prev_batch = Some("p1".to_owned());
+            update
+        })
+        .collect::<Vec<_>>();
+    store
+        .apply_sync_batch(&sync_batch("s1", updates), 10)
+        .unwrap();
     let pre_v11 = json!({
         "type": "m.room.redaction", "event_id": "$red", "sender": "@alice:hs.example.org",
         "origin_server_ts": 90, "redacts": "$target", "content": {}
@@ -782,7 +789,7 @@ async fn bootstrap_versions_resolve_pre_v11_and_v11_redaction_targets() {
     let applied = store
         .apply_history_page(ROOM, HistoryWork::Base, "p1", &page, 20)
         .unwrap();
-    assert!(applied.events_seen >= 1, "pre-v11 redaction resolved");
+    assert_eq!(applied.events_seen, 2);
 
     server.state.push_messages(
         "p1",
@@ -802,7 +809,23 @@ async fn bootstrap_versions_resolve_pre_v11_and_v11_redaction_targets() {
     let applied = store
         .apply_history_page(ROOM2, HistoryWork::Base, "p1", &page, 20)
         .unwrap();
-    assert!(applied.events_seen >= 1, "v11+ redaction resolved");
+    assert_eq!(applied.events_seen, 2);
+
+    let conn = db(&cfg.database);
+    for room in [ROOM, ROOM2] {
+        let (redacted, body): (bool, Option<String>) = conn
+            .query_row(
+                "SELECT redacted, body_text FROM events WHERE room_id = ?1 AND event_id = '$target'",
+                [room],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            redacted,
+            "{room}: the version-specific target must be redacted"
+        );
+        assert!(body.is_none(), "{room}: the redacted body must be removed");
+    }
 }
 
 #[tokio::test]
@@ -881,6 +904,48 @@ async fn device_binding_must_be_reported_and_match() {
         matches!(error, RuntimeError::DeviceUnverified(_)),
         "{error:?}"
     );
+}
+
+/// Device ids are opaque and bound exactly: surrounding whitespace and control
+/// characters are significant, a normalized server value is a different device,
+/// and no device content may leak into the error text.
+#[tokio::test]
+async fn opaque_device_ids_bind_exactly() {
+    let cases = [("  MLN  ", "MLN"), ("dev\u{7}ice", "devXice")];
+    for (configured, normalized) in cases {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(&server, dir.path(), vec![room_id(ROOM)]);
+        cfg.device_id = configured.to_owned();
+        *server.state.whoami.lock().unwrap() = Some(json!({
+            "user_id": "@ingest:hs.example.org",
+            "device_id": configured,
+        }));
+
+        let transport = adapter(&server, &cfg).await;
+        let mut store = Store::open(&cfg.database, &identity(&cfg)).unwrap();
+        let report = runtime::initialize_with_policy(&transport, &cfg, &mut store, &tiny_policy())
+            .await
+            .unwrap_or_else(|error| panic!("exact device {configured:?} must bind: {error:?}"));
+        assert!(report.rooms.iter().any(|room| room == ROOM));
+
+        // The normalized value is a different opaque device id.
+        *server.state.whoami.lock().unwrap() = Some(json!({
+            "user_id": "@ingest:hs.example.org",
+            "device_id": normalized,
+        }));
+        let transport = adapter(&server, &cfg).await;
+        let error = runtime::initialize_with_policy(&transport, &cfg, &mut store, &tiny_policy())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::IdentityMismatch { .. }),
+            "a normalized device id must not match {configured:?}: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(!text.contains(configured), "device content leaked: {text}");
+        assert!(!text.contains(normalized), "device content leaked: {text}");
+    }
 }
 
 #[tokio::test]

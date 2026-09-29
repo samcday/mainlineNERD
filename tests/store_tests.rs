@@ -3849,6 +3849,191 @@ fn seed_configured_room_history_only_fills_never_started_base() {
     assert_eq!(store.room_history_token(ROOM2).unwrap(), None);
 }
 
+/// The first successful sync must seed a never-started base cursor for a ready,
+/// configured, still-eligible room, and only for such a room: readiness and the
+/// mutable policy are part of the shared seeding rule.
+#[test]
+fn apply_sync_batch_seeds_only_ready_configured_eligible_rooms() {
+    const FAILED: &str = "!failed:hs.example.org";
+    const ENCRYPTED: &str = "!encrypted:hs.example.org";
+    const LEFT: &str = "!left:hs.example.org";
+    const BANNED: &str = "!banned:hs.example.org";
+    const UPGRADED: &str = "!upgraded:hs.example.org";
+    const UNCONFIGURED: &str = "!unconfigured:hs.example.org";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    // Ready and eligible: must be seeded by the first committed token.
+    store.register_configured_room(ROOM, None, 10).unwrap();
+    store.set_room_version_control(ROOM, "11", 10).unwrap();
+
+    // Configured but not ready: no validated version.
+    store.register_configured_room(ROOM2, None, 10).unwrap();
+
+    // Known version, but not in the operator's current allowlist.
+    store
+        .set_room_version_control(UNCONFIGURED, "11", 10)
+        .unwrap();
+
+    // Ready but the bootstrap failed.
+    store.register_configured_room(FAILED, None, 10).unwrap();
+    store.set_room_version_control(FAILED, "11", 10).unwrap();
+    store
+        .record_room_metadata_error(FAILED, "boom", 10)
+        .unwrap();
+
+    // Ready but disabled by the mutable history policy.
+    store.register_configured_room(ENCRYPTED, None, 10).unwrap();
+    store.set_room_version_control(ENCRYPTED, "11", 10).unwrap();
+    store
+        .apply_room_control_state(ENCRYPTED, &[encryption_event()], 10)
+        .unwrap();
+    store.register_configured_room(LEFT, None, 10).unwrap();
+    store.set_room_version_control(LEFT, "11", 10).unwrap();
+    store
+        .apply_room_control_state(LEFT, &[departed_member()], 10)
+        .unwrap();
+    store.register_configured_room(BANNED, None, 10).unwrap();
+    store.set_room_version_control(BANNED, "11", 10).unwrap();
+    let mut banned = departed_member();
+    banned["event_id"] = json!("$ban");
+    banned["content"]["membership"] = json!("ban");
+    store
+        .apply_room_control_state(BANNED, &[banned], 10)
+        .unwrap();
+    store.register_configured_room(UPGRADED, None, 10).unwrap();
+    store.set_room_version_control(UPGRADED, "11", 10).unwrap();
+    store
+        .apply_room_control_state(UPGRADED, &[tombstone("!next:hs.example.org")], 10)
+        .unwrap();
+
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![]), 20)
+        .unwrap();
+
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("s1"),
+        "the ready eligible room is seeded from the first committed token"
+    );
+    for room in [
+        ROOM2,
+        FAILED,
+        ENCRYPTED,
+        LEFT,
+        BANNED,
+        UPGRADED,
+        UNCONFIGURED,
+    ] {
+        assert_eq!(
+            store.room_history_token(room).unwrap(),
+            None,
+            "{room} must not be seeded"
+        );
+    }
+    assert_eq!(store.rooms_needing_history().unwrap().len(), 1);
+
+    // The explicit single-room seed honors the same policy.
+    assert!(!store.seed_configured_room_history(ENCRYPTED, 30).unwrap());
+    assert_eq!(store.room_history_token(ENCRYPTED).unwrap(), None);
+}
+
+/// A later committed token must never rewind an active cursor or reopen
+/// stalled/completed work while seeding never-started rooms.
+#[test]
+fn apply_sync_batch_never_rewinds_or_reopens_seeded_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+
+    // An active base cursor on a ready configured room.
+    store.register_configured_room(ROOM, None, 10).unwrap();
+    let mut active = room_update(ROOM);
+    active.state = vec![create_room("11")];
+    active.timeline = vec![message("$live", 100, "live")];
+    active.prev_batch = Some("p1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s0", vec![active]), 10)
+        .unwrap();
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1")
+    );
+
+    // A stalled ready base with a saved cursor.
+    store.register_configured_room(ROOM2, None, 10).unwrap();
+    let mut stalled = room_update(ROOM2);
+    stalled.state = vec![create_room("11")];
+    stalled.timeline = vec![message("$live2", 100, "live2")];
+    stalled.prev_batch = Some("q1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s1", vec![stalled]), 10)
+        .unwrap();
+    store.mark_history_stalled(ROOM2, "403", 15).unwrap();
+
+    // A completed ready base.
+    store.register_configured_room(ROOM3, None, 10).unwrap();
+    let mut completed = room_update(ROOM3);
+    completed.state = vec![create_room("11")];
+    completed.timeline = vec![message("$live3", 100, "live3")];
+    completed.prev_batch = Some("r1".to_owned());
+    store
+        .apply_sync_batch(&sync_batch("s2", vec![completed]), 10)
+        .unwrap();
+    let done = store
+        .apply_history_page(
+            ROOM3,
+            HistoryWork::Base,
+            "r1",
+            &history_page("r1", None, vec![]),
+            15,
+        )
+        .unwrap();
+    assert_eq!(done.status, Some(HistoryStatus::Completed));
+
+    // A later successful sync advances the global token.
+    store
+        .apply_sync_batch(&sync_batch("s3", vec![]), 20)
+        .unwrap();
+
+    assert_eq!(
+        store.room_history_token(ROOM).unwrap().as_deref(),
+        Some("p1"),
+        "an active cursor is never rewound"
+    );
+    assert!(!store.room_history_complete(ROOM).unwrap());
+    assert!(!store.room_history_stalled(ROOM).unwrap());
+    assert_eq!(
+        store.room_history_token(ROOM2).unwrap().as_deref(),
+        Some("q1"),
+        "a stalled cursor is never rewound"
+    );
+    assert!(store.room_history_stalled(ROOM2).unwrap());
+    assert!(
+        store.room_history_complete(ROOM3).unwrap(),
+        "a completed base is never reopened"
+    );
+    assert_eq!(store.room_history_token(ROOM3).unwrap(), None);
+    assert_eq!(
+        store.rooms_needing_history().unwrap().len(),
+        1,
+        "only the still-active room stays queued"
+    );
+}
+
+/// One own-member state event with the archive's bound user id.
+fn departed_member() -> serde_json::Value {
+    json!({
+        "type": "m.room.member",
+        "event_id": "$leave",
+        "sender": "@ingest:hs.example.org",
+        "state_key": "@ingest:hs.example.org",
+        "origin_server_ts": 2,
+        "content": { "membership": "leave" }
+    })
+}
+
 #[test]
 fn set_configured_rooms_clears_removed_entries() {
     let dir = tempfile::tempdir().unwrap();

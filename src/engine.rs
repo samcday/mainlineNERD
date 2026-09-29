@@ -293,13 +293,16 @@ impl<T: Transport> Engine<T> {
     }
 
     /// Build the next base backfill request for a room, or `None` when that
-    /// work item is complete, stalled or has no usable cursor. The eligibility
-    /// check is the store's own durable state, so a stalled or completed base
-    /// is never fetched.
+    /// work item is complete, stalled, disabled by the current room policy or
+    /// has no usable cursor. The eligibility checks are the store's own durable
+    /// state, so a stalled, completed or disabled base is never fetched.
     pub fn base_history_request(
         &self,
         room_id: &str,
     ) -> Result<Option<HistoryRequest>, StoreError> {
+        if !self.store.room_history_allowed(room_id)? {
+            return Ok(None);
+        }
         if self.store.room_history_complete(room_id)? || self.store.room_history_stalled(room_id)? {
             return Ok(None);
         }
@@ -315,17 +318,21 @@ impl<T: Transport> Engine<T> {
     }
 
     /// Build the next bounded gap-repair request for one open job, or `None`
-    /// when the job is closed or has no cursor.
+    /// when the job is closed, has no cursor, or its room is disabled by the
+    /// current room policy.
     pub fn gap_history_request(&self, gap_id: i64) -> Result<Option<HistoryRequest>, StoreError> {
-        Ok(self
-            .store
-            .open_gap_position(gap_id)?
-            .map(|gap| HistoryRequest {
-                room_id: gap.room_id,
-                from: gap.token,
-                to: gap.to_token,
-                limit: self.config.history_limit,
-            }))
+        let Some(gap) = self.store.open_gap_position(gap_id)? else {
+            return Ok(None);
+        };
+        if !self.store.room_history_allowed(&gap.room_id)? {
+            return Ok(None);
+        }
+        Ok(Some(HistoryRequest {
+            room_id: gap.room_id,
+            from: gap.token,
+            to: gap.to_token,
+            limit: self.config.history_limit,
+        }))
     }
 
     /// Commit one finished `/messages` page against the work item its request

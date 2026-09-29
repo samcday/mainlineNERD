@@ -86,15 +86,16 @@ pub struct IdentityMismatch {
 
 impl std::fmt::Display for IdentityMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Device ids are opaque and may contain arbitrary characters, so they
+        // are never echoed into diagnostics; the homeserver/user binding plus
+        // the redaction marker is enough to diagnose a mismatch.
         write!(
             f,
-            "archive is bound to {}/{}/{}; refusing to reuse its cursors for {}/{}/{}",
+            "archive is bound to {}/{}/<device id redacted>; refusing to reuse its cursors for {}/{}/<device id redacted>",
             self.existing.homeserver,
             self.existing.user_id,
-            self.existing.device_id,
             self.requested.homeserver,
-            self.requested.user_id,
-            self.requested.device_id
+            self.requested.user_id
         )
     }
 }
@@ -599,20 +600,7 @@ impl Store {
     /// It is applied both when scheduling work and when accepting a finished
     /// page, so a held response cannot revive a room that a later sync disabled.
     pub fn room_history_allowed(&self, room_id: &str) -> Result<bool, StoreError> {
-        let row: Option<(bool, bool, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT encrypted, successor_room_id IS NOT NULL, own_membership FROM rooms WHERE room_id = ?1",
-                params![room_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        Ok(match row {
-            Some((encrypted, upgraded, membership)) => {
-                !encrypted && !upgraded && !matches!(membership.as_deref(), Some("leave" | "ban"))
-            }
-            None => true,
-        })
+        room_history_allowed_conn(&self.conn, room_id)
     }
 
     /// Record a bounded, sanitized reason a room's metadata is unusable. The
@@ -740,7 +728,11 @@ impl Store {
     /// the global `next_batch` token in a single transaction. Each limited
     /// sync gap is bounded by the previously committed global token and gets
     /// its own durable cursor; the room's base backfill cursor is never
-    /// rewound or reset by a live batch.
+    /// rewound or reset by a live batch. The same transaction seeds a
+    /// never-started base cursor for every ready, configured and still-eligible
+    /// room from the newly committed token, so a room that never appears in
+    /// `/sync` still starts backfill in the run that first makes a token
+    /// available.
     pub fn apply_sync_batch(
         &mut self,
         batch: &SyncBatch,
@@ -768,6 +760,7 @@ impl Store {
             "UPDATE sync_progress SET since_token = ?1, last_success_at = ?2, consecutive_failures = 0, last_error = NULL WHERE id = 1",
             params![batch.next_batch, received_at],
         )?;
+        seed_ready_configured_room_histories(&tx, &batch.next_batch, received_at)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -1252,9 +1245,12 @@ impl Store {
     /// overlap with already-seen live events is deduplicated by event id.
     ///
     /// Only a never-started row is filled: an in-progress, stalled or complete
-    /// base backfill is never rewound, and a room that is not configured now is
-    /// never seeded.
+    /// base backfill is never rewound, and a room that is not configured now or
+    /// is disabled by the mutable history policy is never seeded.
     pub fn seed_configured_room_history(&self, room_id: &str, at: i64) -> Result<bool, StoreError> {
+        if !room_history_allowed_conn(&self.conn, room_id)? {
+            return Ok(false);
+        }
         let changed = self.conn.execute(
             "INSERT INTO room_history (room_id, token, complete, stalled, pages, updated_at)
              SELECT ?1, sp.since_token, 0, 0, 0, ?2 FROM sync_progress sp
@@ -1956,6 +1952,38 @@ fn seed_room_history(
            AND excluded.token IS NOT NULL",
         params![room_id, token, at],
     )?;
+    Ok(())
+}
+
+/// Seed never-started base cursors from a newly committed global token for
+/// every ready, currently configured and still-eligible room.
+///
+/// Readiness (a known room version and no metadata error) and the mutable
+/// history policy (not left/banned, not encrypted, no known successor) are
+/// rechecked here, so a healthy scope advancing the global token can never
+/// admit a room whose bootstrap failed or that a later sync disabled. The
+/// shared [`seed_room_history`] upsert only fills never-started rows: active,
+/// stalled and completed work is never rewound or reopened. Runs inside the
+/// `/sync` commit transaction, so the token and the seeded cursors become
+/// visible together or not at all.
+fn seed_ready_configured_room_histories(
+    conn: &Connection,
+    token: &str,
+    at: i64,
+) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT room_id FROM rooms
+         WHERE configured = 1 AND room_version IS NOT NULL AND metadata_error IS NULL",
+    )?;
+    let candidates: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+    for room_id in candidates {
+        if room_history_allowed_conn(conn, &room_id)? {
+            seed_room_history(conn, &room_id, Some(token), at)?;
+        }
+    }
     Ok(())
 }
 

@@ -180,7 +180,12 @@ impl Config {
             ))
         })?;
 
-        let device_id = file.device_id.trim().to_owned();
+        // Device IDs are opaque: Matrix does not define a grammar for them, so
+        // the exact TOML string is preserved and compared exactly (byte for
+        // byte) against `/whoami`. Leading/trailing whitespace and control
+        // characters are part of the identifier, not formatting. Only an empty
+        // value is rejected, and the value is never echoed in an error.
+        let device_id = file.device_id;
         if device_id.is_empty() {
             return Err(ConfigError::Invalid(
                 "device_id must not be empty".to_owned(),

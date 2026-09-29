@@ -170,15 +170,19 @@ pub async fn initialize_with_policy(
     }
     match &who.device_id {
         None => {
+            // The configured device id is opaque and may contain arbitrary
+            // characters; it is never echoed into diagnostics.
             return Err(RuntimeError::DeviceUnverified(format!(
-                "{}/{}",
-                config.user_id, config.device_id
+                "for the token's user {}",
+                config.user_id
             )));
         }
         Some(device) if device.as_str() != config.device_id => {
+            // Compare exactly: no trimming or other normalization is applied
+            // to an opaque device id. Neither device value is echoed.
             return Err(RuntimeError::IdentityMismatch {
-                expected: format!("{}/{}", config.user_id, config.device_id),
-                found: format!("{}/{}", who.user_id, device),
+                expected: format!("{}/<device id redacted>", config.user_id),
+                found: format!("{}/<device id redacted>", who.user_id),
             });
         }
         Some(_) => {}
@@ -950,9 +954,12 @@ fn bounded_store_reason(error: &EngineError) -> String {
     }
 }
 
+/// The full server hint, preserved exactly: a long `Retry-After` must not be
+/// shortened into an earlier request. Transient backoff caps and the no-hint
+/// fallback are separate policies and are not applied to a present hint.
 fn rate_delay(hint: Option<u64>, fallback: Duration) -> Duration {
     match hint {
-        Some(ms) => Duration::from_millis(ms).min(Duration::from_secs(3_600)),
+        Some(ms) => Duration::from_millis(ms),
         None => fallback,
     }
 }

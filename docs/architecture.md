@@ -134,8 +134,10 @@ store tables; our SQLite archive is the only source of truth for cursors.
   still committed. A 401 stops the whole run; a 403 or not-found affects only
   that room.
 - A configured room that is idle and absent from `/sync` still gets a base
-  cursor: a never-started cursor is seeded from the committed global token.
-  In-progress, stalled and complete work is never rewound.
+  cursor: a never-started cursor is seeded from the committed global token in
+  the same transaction that first makes that token available, for ready,
+  still-eligible rooms only. In-progress, stalled and complete work is never
+  rewound or reopened, and an unready or disabled room is never admitted.
 - Rooms whose own membership is `leave`/`ban`, encrypted rooms and upgrade
   successors are flagged for operator action instead of being expanded. No
   automatic join ever follows an observed departure, and an explicit join uses
@@ -328,8 +330,10 @@ store tables; our SQLite archive is the only source of truth for cursors.
   wrapped so it can never appear in a `Debug` value, log line or panic message;
   the config file stores only the variable name.
 - `initialize` validates `/whoami` against the configured user and device before
-  any room is registered or any batch applied. A missing device id is rejected
-  because this dedicated-device pilot cannot verify that binding.
+  any room is registered or any batch applied. Device ids are opaque and
+  compared exactly (no trimming or other normalization); a missing or different
+  device id is rejected because this dedicated-device pilot cannot verify that
+  binding. Neither the token nor a device id is echoed into error text.
   The client is configured from the explicit homeserver and redirects are
   disabled, so it never follows an untrusted link or credential redirect.
 - New archives and exports live under an owner-private data directory. An

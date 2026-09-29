@@ -279,3 +279,78 @@ fn parse_and_url_errors_never_echo_source_or_credentials() {
         }
     }
 }
+
+/// Device ids are completely opaque: surrounding whitespace is part of the
+/// identifier and must survive a config round trip byte for byte.
+#[test]
+fn device_id_round_trips_surrounding_whitespace_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        r#"
+homeserver = "https://hs.example.org"
+user_id = "@ingest:hs.example.org"
+device_id = "  MLN\tDEV  "
+data_dir = "{}"
+[[rooms]]
+id = "!room:hs.example.org"
+"#,
+        dir.path().display()
+    );
+    let path = write_config(dir.path(), &body);
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.device_id, "  MLN\tDEV  ",
+        "an opaque device id must be preserved exactly, not trimmed"
+    );
+}
+
+/// Escaped control characters are legal opaque device-id content and must be
+/// decoded and preserved exactly.
+#[test]
+fn device_id_round_trips_escaped_control_characters_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        r#"
+homeserver = "https://hs.example.org"
+user_id = "@ingest:hs.example.org"
+device_id = "dev\u0007ice"
+data_dir = "{}"
+[[rooms]]
+id = "!room:hs.example.org"
+"#,
+        dir.path().display()
+    );
+    let path = write_config(dir.path(), &body);
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.device_id, "dev\u{7}ice");
+}
+
+/// An empty value is a missing configuration field; whitespace is still a
+/// legitimate opaque identifier and must not be treated as empty.
+#[test]
+fn device_id_preserves_whitespace_but_rejects_empty_value() {
+    let dir = tempfile::tempdir().unwrap();
+    for value in ["", "   ", "\t"] {
+        let body = format!(
+            r#"
+homeserver = "https://hs.example.org"
+user_id = "@ingest:hs.example.org"
+device_id = "{value}"
+data_dir = "{}"
+[[rooms]]
+id = "!room:hs.example.org"
+"#,
+            dir.path().display()
+        );
+        let path = write_config(dir.path(), &body);
+        if value.is_empty() {
+            let error = Config::load(&path).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid config: device_id must not be empty"
+            );
+        } else {
+            assert_eq!(Config::load(&path).unwrap().device_id, value);
+        }
+    }
+}

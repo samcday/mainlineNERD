@@ -14,7 +14,7 @@ access token is read from the environment variable named by `token_env`
 | --- | --- |
 | `homeserver` | Explicit base URL. HTTPS is required; plain HTTP is accepted only for loopback hosts (`127.0.0.1`, `::1`, `localhost`). Credentials, query strings and fragments are rejected. |
 | `user_id` | The exact account the token must belong to. |
-| `device_id` | The expected device binding. `/whoami` is checked against it when the server reports a device. |
+| `device_id` | The expected device binding. Device ids are opaque: the value is preserved exactly as written and compared exactly (no trimming) against `/whoami`; a missing or different device is rejected. The value is never echoed in errors. |
 | `token_env` | Environment variable holding the token. |
 | `data_dir` | Owner-private directory for the archive. Created `0700` if absent; an existing group/world-accessible directory is refused. |
 | `database` | Relative to `data_dir` unless absolute. |
@@ -78,13 +78,13 @@ existing file, symlink or hardlink and creates new files owner-only (`0600`).
 2. Read the token from the named environment variable.
 3. Build the client (memory-only SDK store, E2EE and key forwarding disabled,
    redirects disabled) and fetch the server's supported versions.
-4. `/whoami` must match the configured user (and device, when reported).
-5. Open or create the archive, bound to the configured homeserver/user/device.
+4. Open or create the archive, bound to the configured homeserver/user/device.
+5. `/whoami` must match both the configured user and device.
 6. Register the allowlist, resolve and pin aliases, perform explicit joins, and
    learn room versions from `m.room.create` where the archive lacks one.
 7. Start the coordinator.
 
-Any mismatch in steps 1-4 refuses the run before a single event is ingested.
+Any failure in steps 1-5 refuses the run before a single event is ingested.
 
 ## Runtime behaviour
 
@@ -96,7 +96,8 @@ Any mismatch in steps 1-4 refuses the run before a single event is ingested.
   small bounded ready set is materialized, so a busy base backfill does not
   starve a newly opened gap or a newly seeded room.
 - A committed global sync token seeds a never-started base cursor for an idle
-  configured room, so history starts even if the room never appears in `/sync`.
+  configured room in the same transaction that commits the token, so history
+  starts in that run even if the room never appears in `/sync`.
 - Transient failures back off with bounded exponential delay and jitter. A 429
   honours `Retry-After` (seconds or HTTP date) or the Matrix retry hint, and
   falls back to a conservative delay when neither is present; it always halts

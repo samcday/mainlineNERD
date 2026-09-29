@@ -4,6 +4,7 @@
 mod common;
 
 use std::path::Path;
+use std::time::Duration;
 
 use common::*;
 use mainlinenerd_ingest::engine::{
@@ -733,6 +734,127 @@ async fn stalled_base_makes_no_requests_even_after_reopen() {
         assert_eq!(
             engine.store().room_history_token(ROOM).unwrap().as_deref(),
             Some("p1")
+        );
+    }
+}
+
+/// Every policy block (leave, ban, encrypted, upgraded) must stop both the
+/// base and the gap public sequential paths before any transport request is
+/// built, leave all durable state untouched, and never starve a healthy room.
+#[tokio::test]
+async fn disabled_rooms_make_no_sequential_history_requests() {
+    let cases: [(&str, Vec<serde_json::Value>, Option<&str>); 4] = [
+        ("encrypted", vec![encryption_event()], None),
+        ("upgraded", vec![tombstone("!next:hs.example.org")], None),
+        ("left", vec![], Some("leave")),
+        ("banned", vec![], Some("ban")),
+    ];
+    for (label, state, membership) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.db");
+        let mut engine = engine(FakeTransport::new(), &path);
+
+        // ROOM has an active base cursor and one open bounded gap.
+        seed_live_room(&mut engine).await;
+        let mut limited = room_update(ROOM);
+        limited.timeline = vec![message("$live2", 300, "live2")];
+        limited.prev_batch = Some("p2".to_owned());
+        limited.limited = true;
+        engine
+            .transport()
+            .push_sync(sync_batch("s2", vec![limited]));
+        engine.poll_sync_once(20).await.unwrap();
+        let gap_id = engine.store().open_gap_positions().unwrap()[0].gap_id;
+
+        // ROOM2 is healthy and has its own base work.
+        let mut healthy = room_update(ROOM2);
+        healthy.prev_batch = Some("q1".to_owned());
+        engine
+            .transport()
+            .push_sync(sync_batch("s3", vec![healthy]));
+        engine.poll_sync_once(30).await.unwrap();
+
+        // Disable ROOM with the current policy signal.
+        let mut control = room_update(ROOM);
+        control.state = state;
+        control.own_membership = membership.map(str::to_owned);
+        engine
+            .transport()
+            .push_sync(sync_batch("s4", vec![control]));
+        engine.poll_sync_once(40).await.unwrap();
+
+        // The request builders themselves honor the policy.
+        assert!(
+            engine.base_history_request(ROOM).unwrap().is_none(),
+            "{label}: base request builder"
+        );
+        assert!(
+            engine.gap_history_request(gap_id).unwrap().is_none(),
+            "{label}: gap request builder"
+        );
+
+        // Both sequential entry points return promptly with zero requests.
+        let base = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run_room_history_once(ROOM, 50),
+        )
+        .await
+        .expect("a disabled base must return promptly")
+        .unwrap();
+        assert_eq!(base.pages_fetched, 0, "{label}: no page may be counted");
+        assert!(!base.completed && !base.stalled, "{label}");
+        let gap = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run_gap_repair_once(gap_id, 51),
+        )
+        .await
+        .expect("a disabled gap must return promptly")
+        .unwrap();
+        assert_eq!(gap.pages_fetched, 0, "{label}: no page may be counted");
+        assert!(!gap.repaired && !gap.unresolved, "{label}");
+        assert_eq!(
+            engine.transport().history_call_count(),
+            0,
+            "{label}: a disabled room must make zero transport requests"
+        );
+
+        // Neither the base cursor/progress nor the gap job moved.
+        let report = engine.store().status().unwrap();
+        let disabled = report.rooms.iter().find(|r| r.room_id == ROOM).unwrap();
+        assert!(disabled.history_token_set, "{label}");
+        assert_eq!(
+            engine.store().room_history_token(ROOM).unwrap().as_deref(),
+            Some("p1"),
+            "{label}: the base cursor must not move"
+        );
+        assert_eq!(disabled.history_pages, 0, "{label}");
+        assert!(!disabled.history_complete, "{label}");
+        assert!(!disabled.history_stalled, "{label}");
+        let gap_position = engine.store().open_gap_position(gap_id).unwrap().unwrap();
+        assert_eq!(gap_position.token, "p2", "{label}");
+        assert_eq!(gap_position.to_token.as_deref(), Some("s1"), "{label}");
+
+        // In the same run, the healthy room still progresses.
+        engine.transport().push_history(
+            "q1",
+            history_page("q1", None, vec![message("$r2old", 10, "r2")]),
+        );
+        let run = engine.run_history_once(60).await.unwrap();
+        assert_eq!(
+            run.rooms_completed, 1,
+            "{label}: the healthy room completes"
+        );
+        assert_eq!(run.pages_fetched, 1, "{label}");
+        assert_eq!(run.rooms_stalled, 0, "{label}");
+        assert_eq!(run.gaps_repaired, 0, "{label}");
+        assert_eq!(
+            engine.transport().history_call_count(),
+            1,
+            "{label}: only the healthy room may be requested"
+        );
+        assert!(
+            engine.store().room_history_complete(ROOM2).unwrap(),
+            "{label}: the healthy room's base completed"
         );
     }
 }

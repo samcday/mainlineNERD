@@ -883,6 +883,156 @@ async fn empty_sync_responses_are_paced_and_committed() {
     handle.await.unwrap().unwrap();
 }
 
+/// A fresh archive has no committed token, so `initialize` cannot seed an idle
+/// configured room. The first successful sync must seed it in the same run.
+#[tokio::test(start_paused = true)]
+async fn first_committed_token_seeds_a_ready_idle_room_in_the_same_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let store = open_store(&path);
+    store.register_configured_room(ROOM, None, 10).unwrap();
+    store.set_room_version_control(ROOM, "11", 10).unwrap();
+    assert_eq!(store.since_token().unwrap(), None);
+    assert_eq!(store.room_history_token(ROOM).unwrap(), None);
+
+    let transport = ControllableTransport::new();
+    transport.hold_sync(true);
+    transport.push_sync(sync_batch("s1", vec![]));
+    transport.push_history(
+        "s1",
+        history_page("s1", None, vec![message("$hist", 50, "hist")]),
+    );
+
+    let (tx, handle) = spawn_run(&transport, store, RunSettings::run(1_000));
+    tokio::time::timeout(Duration::from_secs(30), transport.wait_for_history(1))
+        .await
+        .expect("the first committed token must seed a request in the same run");
+    let requests = transport.history_requests();
+    assert_eq!(requests[0].room_id, ROOM);
+    assert_eq!(
+        requests[0].from, "s1",
+        "the first committed token must seed the idle room in the same run"
+    );
+
+    wait_until("the seeded page to commit", || {
+        scalar_i64(
+            &db(&path),
+            "SELECT COUNT(*) FROM events WHERE event_id = '$hist'",
+        ) == 1
+    })
+    .await;
+    let _ = tx.send(());
+    handle.await.unwrap().unwrap();
+
+    let conn = db(&path);
+    assert_eq!(
+        scalar_string(&conn, "SELECT since_token FROM sync_progress WHERE id = 1"),
+        Some("s1".to_owned())
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT complete FROM room_history WHERE room_id = '!room:hs.example.org'"
+        ),
+        1,
+        "the seeded page completed the base backfill"
+    );
+}
+
+/// A server `Retry-After` longer than one hour is preserved in full: no request
+/// may happen at 3600s, and none before the full 7200s hint.
+#[tokio::test(start_paused = true)]
+async fn long_rate_limit_hint_is_honored_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+    seed_room(&mut store, ROOM, "p0", "$a", "s0");
+
+    let transport = ControllableTransport::new();
+    transport.hold_sync(true);
+    transport.push_history_error(
+        "p0",
+        TransportError::RateLimited {
+            retry_after_ms: Some(7_200_000),
+        },
+    );
+    transport.push_history("p0", history_page("p0", None, vec![]));
+
+    let (tx, handle) = spawn_run(&transport, store, RunSettings::run(1_000));
+    tokio::time::timeout(Duration::from_secs(30), transport.wait_for_history(1))
+        .await
+        .expect("the rate-limited work item must be attempted");
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    let first = transport.history_request_times()[0];
+
+    // One hour later no second request may have happened: the hint is 7200s,
+    // not a clamped 3600s.
+    tokio::time::advance(Duration::from_secs(3_600)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        transport.history_call_count(),
+        1,
+        "a 7200s hint must not be shortened to 3600s"
+    );
+
+    // The second request only happens once the full hint has elapsed; the
+    // bound is larger than the full hint so paused time can reach the timer.
+    tokio::time::timeout(Duration::from_secs(7_500), transport.wait_for_history(2))
+        .await
+        .expect("the full hint must eventually release the retry");
+    let times = transport.history_request_times();
+    assert!(
+        times[1] - first >= Duration::from_secs(7_200),
+        "the full server hint must be honored: {times:?}"
+    );
+    let _ = tx.send(());
+    handle.await.unwrap().unwrap();
+}
+
+/// Cancellation must still work while a long rate-limit pause is pending.
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_a_long_rate_limit_pause_is_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.db");
+    let mut store = open_store(&path);
+    seed_room(&mut store, ROOM, "p0", "$a", "s0");
+
+    let transport = ControllableTransport::new();
+    transport.hold_sync(true);
+    transport.push_history_error(
+        "p0",
+        TransportError::RateLimited {
+            retry_after_ms: Some(7_200_000),
+        },
+    );
+    transport.push_history("p0", history_page("p0", None, vec![]));
+
+    let (tx, handle) = spawn_run(&transport, store, RunSettings::run(1_000));
+    tokio::time::timeout(Duration::from_secs(30), transport.wait_for_history(1))
+        .await
+        .expect("the rate-limited work item must be attempted");
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(3_600)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(transport.history_call_count(), 1);
+
+    let _ = tx.send(());
+    let result = tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("cancellation must not wait out the rate-limit pause")
+        .unwrap();
+    assert!(result.is_ok());
+    assert_eq!(
+        transport.history_call_count(),
+        1,
+        "cancellation must not fire another request"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn held_pages_cannot_revive_disabled_rooms() {
     let cases: [(&str, Vec<serde_json::Value>, bool, Option<&str>); 3] = [
