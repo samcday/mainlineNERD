@@ -1,0 +1,43 @@
+# mainlineNERD ingestion configuration.
+#
+# Never put secrets in this file. The access token is read from the named
+# environment variable at startup.
+#
+# `follow` runs live sync only; `run` also backfills accessible history.
+
+# Explicit homeserver base URL. HTTPS is required unless the host is loopback.
+homeserver = "https://matrix.example.org"
+
+# The exact account/device this archive is bound to. A token whose /whoami
+# identity differs is refused before any ingestion. Device ids are opaque:
+# this value is compared exactly, so whitespace is significant.
+user_id = "@mainlinenerd:example.org"
+device_id = "MLN-INGEST"
+
+# Environment variable holding the bot access token (MLN_ACCESS_TOKEN by default).
+token_env = "MLN_ACCESS_TOKEN"
+
+# Owner-private storage. Must not be group/world accessible; created 0700 if absent.
+data_dir = "~/.local/share/mainlinenerd"
+# Relative to data_dir; absolute paths are used as-is.
+database = "archive.sqlite3"
+
+# Conservative pacing: one history request per second overall.
+history_interval_ms = 1000
+history_limit = 50
+sync_timeout_ms = 30000
+
+[[rooms]]
+# Exactly one of `alias` or `id` per entry. Alias identity is case-sensitive
+# (`#Room:` and `#room:` are distinct). An alias is resolved once and pinned;
+# a later resolution to a different room is refused.
+alias = "#engineering:example.org"
+# Explicit operator opt-in to join. A recorded leave/ban is never auto-reversed.
+join = false
+
+[[rooms]]
+id = "!ops:example.org"
+# Optional routing hints for a cold homeserver that cannot route an unhinted
+# room id (Matrix `via`). Alias entries automatically retain the servers the
+# homeserver returns for the alias.
+# via = ["example.org"]

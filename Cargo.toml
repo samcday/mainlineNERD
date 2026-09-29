@@ -1,0 +1,33 @@
+[package]
+name = "mainlinenerd-ingest"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "mainlineNERD passive Matrix ingestion: durable SQLite event store and history engine"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "mln-ingest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+js_int = "0.2"
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["rustls-aws-lc-rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+ruma-common = "0.20.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+url = "2"
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
