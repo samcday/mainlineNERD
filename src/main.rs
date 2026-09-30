@@ -12,17 +12,18 @@
 
 use std::{path::Path, path::PathBuf, time::Duration};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::{SyncSettings, SyncToken},
-    reqwest::Url,
+    reqwest::{self, tls::Version, Url},
     ruma::{presence::PresenceState, OwnedDeviceId, UserId},
     Client, SessionMeta, SessionTokens,
 };
 use rusqlite::{params, Connection};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use url::Host;
 
 /// Access tokens are read from the environment only: never from argv (visible in
 /// the process table) and never written to logs or disk.
@@ -31,6 +32,9 @@ const TOKEN_ENV: &str = "MATRIX_ACCESS_TOKEN";
 /// Caps the server-side long-poll of the one `/sync` request. It does not bound
 /// the process: matrix-sdk's default retries may outlast it.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total per-request HTTP timeout, matching matrix-sdk's own default settings.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -66,22 +70,23 @@ async fn main() -> Result<()> {
     let user_id = UserId::parse(args.user.as_str())
         .with_context(|| format!("not a valid user ID: {}", args.user))?;
     let device_id = OwnedDeviceId::from(args.device.as_str());
-    let homeserver =
-        Url::parse(&args.homeserver).context("homeserver must be an absolute http(s) URL")?;
-    ensure!(
-        matches!(homeserver.scheme(), "http" | "https"),
-        "homeserver URL must use http or https"
-    );
-    ensure!(
-        homeserver.username().is_empty() && homeserver.password().is_none(),
-        "homeserver URL must not embed credentials"
-    );
+    let homeserver = validate_homeserver(&args.homeserver)?;
 
-    // The SDK's own client with its default retry/backoff policy: no custom
-    // retry loop. Without the `e2e-encryption` feature no crypto store or key
-    // machinery is created.
+    // The SDK's own client, keeping its retry/backoff request loop rather than
+    // any custom retry framework. The single HTTP client is built here with
+    // `no_proxy` so ambient HTTP_PROXY/ALL_PROXY cannot divert homeserver
+    // traffic (and the access token); its timeout and TLS floor match the SDK's
+    // defaults, and E2EE stays compiled out.
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .user_agent(concat!("mainlinenerd/", env!("CARGO_PKG_VERSION")))
+        .min_tls_version(Version::TLS_1_2)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("building the HTTP client")?;
     let client = Client::builder()
         .homeserver_url(homeserver.as_str())
+        .http_client(http)
         .build()
         .await
         .context("building the Matrix client")?;
@@ -178,4 +183,57 @@ fn record_startup(db: &Path, homeserver: &str, user_id: &UserId) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Parses the operator-supplied homeserver URL and enforces the transport
+/// policy: HTTPS for any host, plain HTTP only for loopback (`localhost` or a
+/// loopback IPv4/IPv6 address), never a hostless URL and never credentials
+/// embedded in the URL.
+fn validate_homeserver(raw: &str) -> Result<Url> {
+    let url = Url::parse(raw).context("homeserver must be an absolute http(s) URL")?;
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "homeserver URL must not embed credentials"
+    );
+    let loopback = match url.host() {
+        // Hostless http(s) URLs do not parse; keep this arm conservative.
+        None => false,
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+    };
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
+        "http" => bail!(
+            "plain http is only allowed for loopback homeservers; the access token would be sent in cleartext"
+        ),
+        scheme => bail!("homeserver URL must use https or loopback http, not {scheme:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_homeserver;
+
+    /// Transport policy table: HTTPS anywhere, HTTP only on loopback, hostless
+    /// URLs and embedded credentials rejected. No network access involved.
+    #[test]
+    fn homeserver_urls_are_https_or_loopback_http() {
+        for (url, ok) in [
+            ("https://matrix.example.org", true),
+            ("https://127.0.0.1:8448", true),
+            ("http://localhost:8008", true),
+            ("http://127.0.0.1:8008", true),
+            ("http://127.99.1.2:8008", true),
+            ("http://[::1]:8008", true),
+            ("http://matrix.example.org", false),
+            ("http://[2001:db8::1]:8008", false),
+            ("https://", false),
+            ("http://user:pass@localhost:8008", false),
+            ("ftp://localhost:8008", false),
+        ] {
+            assert_eq!(validate_homeserver(url).is_ok(), ok, "verdict for {url}");
+        }
+    }
 }

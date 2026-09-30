@@ -13,3 +13,4 @@ matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-a
 rusqlite = { version = "0.40", features = ["bundled"] }
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+url = "2"

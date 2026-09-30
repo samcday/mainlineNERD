@@ -1567,6 +1567,7 @@ dependencies = [
  "rusqlite",
  "time",
  "tokio",
+ "url",
 ]
 
 [[package]]

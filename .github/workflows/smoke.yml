@@ -27,6 +27,10 @@ jobs:
       SMOKE_READY_TIMEOUT: "120"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Later steps run repository-controlled build/test code; it has no use
+          # for the checkout credential.
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -36,6 +40,9 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --locked
 
       - name: Real Synapse smoke test
         # scripts/local-smoke.sh checks the happy path (receipt, SQLite row,

@@ -103,8 +103,15 @@ rm -f "$data/login.json" # it held the throwaway password
 log "happy path: verified /whoami, one initial sync, startup record written"
 db=$data/startup.db
 before_syncs=$(sync_lines | wc -l)
-MATRIX_ACCESS_TOKEN="$token" "$bin" --homeserver "$hs" --user "$user" --device "$device" --db "$db" \
-    | tee "$data/happy.log"
+# Bogus proxies are scoped to this one process: the binary builds its HTTP client
+# with no_proxy, so if it honoured them every request would go to a dead port and
+# the check would fail. Fixture curl/container traffic is untouched.
+bogus_proxy=(NO_PROXY= no_proxy=
+    ALL_PROXY=http://127.0.0.1:1 all_proxy=http://127.0.0.1:1
+    HTTP_PROXY=http://127.0.0.1:1 http_proxy=http://127.0.0.1:1
+    HTTPS_PROXY=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1)
+env MATRIX_ACCESS_TOKEN="$token" "${bogus_proxy[@]}" "$bin" \
+    --homeserver "$hs" --user "$user" --device "$device" --db "$db" | tee "$data/happy.log"
 grep -Fq "startup-check ok homeserver=$hs_url user=$user device=$device " "$data/happy.log" \
     || fail "missing successful receipt"
 [ "$(sqlite3 "$db" "select homeserver || ' ' || user_id from startup_state where id = 1")" = "$hs_url $user" ] \

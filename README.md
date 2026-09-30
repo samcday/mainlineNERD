@@ -26,7 +26,13 @@ long-poll, and SDK retries can outlast it. Wall-clock limits (readiness waits an
 a job timeout) live in the fixture and CI, not in the check.
 
 The access token is read from `MATRIX_ACCESS_TOKEN` only; it is never accepted
-as an argument, logged or stored.
+as an argument, logged or stored. The homeserver URL must be `https://…`, and
+plain `http://` is accepted only for loopback hosts (`localhost` or a loopback
+IPv4/IPv6 address); hostless URLs and URLs carrying credentials are rejected, so
+the token is not sent in cleartext to a remote homeserver. The HTTP client uses `no_proxy`,
+so an ambient `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` cannot divert homeserver
+traffic. The valid `--homeserver` forms are covered by a table-driven unit test
+(`cargo test`).
 
 ```sh
 export MATRIX_ACCESS_TOKEN=...   # not committed
@@ -47,8 +53,10 @@ followed by checks that an invalid token and a mismatched user/device fail
 without leaving a startup record. Each run gets its own private `out/smoke-*`
 directory and matching container name: the container is loopback-only and
 removed on exit, the run directory is removed on success and kept for debugging
-on failure. Nothing pre-existing is deleted. Needs docker or podman plus `curl`,
-`jq`, `python3`, `sqlite3` and `openssl`.
+on failure. Nothing pre-existing is deleted. The happy-path invocation runs with
+bogus `HTTP_PROXY`/`ALL_PROXY` values scoped to that single process, proving the
+binary does not route through them. Needs docker or podman plus `curl`, `jq`,
+`python3`, `sqlite3` and `openssl`.
 
 The pinned image is `ghcr.io/element-hq/synapse:v1.162.0` (`SYNAPSE_IMAGE`
 overrides it). CI (`.github/workflows/smoke.yml`) runs the same script with
