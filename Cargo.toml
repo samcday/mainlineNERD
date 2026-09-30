@@ -1,0 +1,15 @@
+[package]
+name = "mainlinenerd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+publish = false
+description = "mainlineNERD: one-shot Matrix homeserver startup check (SDK-managed retries). Not a collector yet."
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
