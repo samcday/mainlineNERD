@@ -31,7 +31,8 @@ plain `http://` is accepted only for loopback hosts (`localhost` or a loopback
 IPv4/IPv6 address); hostless URLs and URLs carrying credentials are rejected, so
 the token is not sent in cleartext to a remote homeserver. The HTTP client uses `no_proxy`,
 so an ambient `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` cannot divert homeserver
-traffic. The valid `--homeserver` forms are covered by a table-driven unit test
+traffic. Automatic redirects are disabled to preserve this transport policy.
+The valid `--homeserver` forms are covered by a table-driven unit test
 (`cargo test`).
 
 ```sh

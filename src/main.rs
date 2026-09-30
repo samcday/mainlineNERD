@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
     // defaults, and E2EE stays compiled out.
     let http = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("mainlinenerd/", env!("CARGO_PKG_VERSION")))
         .min_tls_version(Version::TLS_1_2)
         .timeout(REQUEST_TIMEOUT)
