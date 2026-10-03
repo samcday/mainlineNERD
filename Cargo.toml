@@ -6,6 +6,11 @@ rust-version = "1.96"
 publish = false
 description = "mainlineNERD: one-shot Matrix homeserver startup check (SDK-managed retries). Not a collector yet."
 
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

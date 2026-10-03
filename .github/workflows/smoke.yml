@@ -20,10 +20,7 @@ jobs:
     # Hard ceiling: the whole job, including image pull and build, is bounded.
     timeout-minutes: 30
     env:
-      # Pinned official Synapse image and toolchain; scripts/local-smoke.sh
-      # defaults to the same image version and rust-toolchain.toml pins the same
-      # Rust version for local runs.
-      SYNAPSE_IMAGE: ghcr.io/element-hq/synapse:v1.162.0
+      # The xtask owns the pinned Synapse image used locally and in CI.
       SMOKE_READY_TIMEOUT: "120"
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +35,12 @@ jobs:
 
       - name: Format and lint
         run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Unit tests
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Real Synapse smoke test
-        # scripts/local-smoke.sh checks the happy path (receipt, SQLite row,
-        # one successful initial /sync in Synapse's access log) and that bad
-        # credentials/identity write no record.
-        run: timeout 22m bash scripts/local-smoke.sh
+        # The real binary, its SQLite receipt, and Synapse's access log.
+        run: timeout 22m cargo xtask smoke

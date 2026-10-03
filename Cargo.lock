@@ -839,6 +839,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -2229,6 +2230,7 @@ checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -2246,6 +2248,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -2917,6 +2921,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3680,6 +3685,19 @@ dependencies = [
  "rand_core 0.10.1",
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "time",
+ "uuid",
 ]
 
 [[package]]
