@@ -109,8 +109,10 @@ For the PR:
    missing, cancelled, skipped without a verified exemption, or unverifiable are
    blockers. Do not treat an empty check list as evidence that an expected check
    passed.
-5. Use a bounded watch for running checks, for example
-   `gh pr checks <number> --repo samcday/mainlineNERD --required --watch`.
+5. Limit a running-check watch to fifteen minutes:
+   `timeout 15m gh pr checks <number> --repo samcday/mainlineNERD --required --watch`.
+   Confirm that `timeout` supports this invocation; if unavailable, report the
+   verification blocker rather than starting an unbounded watch.
    If the watch times out or verification remains incomplete, report that the
    change has not landed. Starting checks is not successful completion.
 6. Recheck the PR head and destination before merging. If either changed, update
