@@ -1,0 +1,19 @@
+Managed-checkout restoration observation
+
+Observed HEAD: 8e6e615eb92e666c16ae4995bba17a422d1c8b8f (main).
+Archive reference: 0c23c06dfd2e604d7da6febdbb52988ed4cbf459 (archive/homeserver-smoke).
+
+Six untracked files reappeared despite the previous clean checkout. Each was byte-identical to its archived version; none exists in the primary checkout, whose Git status is clean. No new implementation was authored.
+
+Verification used git status, git ls-files --others --exclude-standard, git show of each archived path, byte comparison and SHA-256:
+
+.github/workflows/smoke.yml: 46 lines; SHA-256 09257ff1805e658810af498f06e77617134122b00bf8e2124dbbbf730802f1db
+AGENTS.md: 30 lines; SHA-256 d992bfb5625567ef0a0a990bda2531422a666d0be97d08e131ef9f2d8c25723e
+Cargo.lock: 3836 lines; SHA-256 4520f7395d8946f257b3abc6bab09f791ebc5b9863248524984544bb66bf91c3
+Cargo.toml: 21 lines; SHA-256 b3ee42063a75839e02136e9a7a69d6b7b4e9f9673ff45cabc3a57c00d7cb0f06
+rust-toolchain.toml: 3 lines; SHA-256 e59c5da37d1f9f4e0f815bc188cb6056fc7410c9cdaa9673c2d44da557c75d12
+src/main.rs: 240 lines; SHA-256 12e71551ed4fcf9ff48dfa3b2736fc6db1eaa27bc1e815db8d12641b0ba379df
+
+The managed clone also initially had origin/main at 4299e4b, while HEAD was 8e6e615; fetching restored origin/main to 8e6e615. Its HEAD reflog contained only initialization/reset entries. This is consistent with checkout reconstruction, but the exact Delta restoration mechanism was not established. No Delta internals or credentials were inspected.
+
+The duplicate files were preserved in the published archive branch before removal. Primary checkout was read-only throughout.
