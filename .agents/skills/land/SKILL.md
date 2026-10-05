@@ -23,6 +23,8 @@ request. Stop for genuine blockers or ambiguous scope.
 - Read applicable instructions and inspect the current branch, working tree,
   staged changes, diff, and any existing PR. Preserve unrelated work. If changes
   in the same file cannot be separated confidently, ask the user.
+- Record the source branch, starting HEAD and working-tree status before
+  preparation, for the parent checkout handoff.
 - Inspect Git remotes and GitHub authentication. Use the source remote for
   `samcday/mainlineNERD`, normally `origin`, never the `local` backlink.
 - The destination is `main`. Confirm that it remains the repository's default
@@ -155,3 +157,19 @@ blocked after the merge, report precisely what landed and what remains unfinishe
 Leave source and archive branches intact. Finish with the PR link, resulting
 commit, destination, verification outcome, and any remaining blocker. Do not
 reset unrelated work or imply that another checkout has been updated.
+
+## Parent checkout handoff
+
+After remote verification, send the parent a checkout-reconciliation request
+with the recorded source branch/starting HEAD/status, verified PR head, and
+landed destination/commit.
+
+The parent must recheck its own checkout. Only if it is clean (including no
+untracked work) and its branch/HEAD match the recorded source state may it fetch and
+fast-forward/switch to the destination. Otherwise leave it untouched and report
+what remains. Verify the landed commit is reachable and the branch diff is empty.
+
+Never reach into the parent's filesystem from the Land child. Do not reset,
+rebase, force-push or delete branches to clear a diff. Report "merged remotely"
+and "parent checkout synchronized" separately; if reconciliation is pending,
+say so rather than implying it happened.
