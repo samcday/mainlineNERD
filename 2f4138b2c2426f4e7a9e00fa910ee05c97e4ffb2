@@ -48,3 +48,23 @@ license lines, and 928 other setup/planning additions. Handwritten Rust: 0 lines
 No real Matrix APIs, accounts, rooms, media, transcripts, or credentials were used.
 No product change was archived. No merge, release, deployment, or protection change
 was performed. Independent Delta review and detailed story approval remain pending.
+
+GitHub verification, 2026-10-06
+PR: https://github.com/samcday/mainlineNERD/pull/5 (draft)
+Head: 2f4138b2c2426f4e7a9e00fa910ee05c97e4ffb2
+Run: https://github.com/samcday/mainlineNERD/actions/runs/37455170695
+Job: https://github.com/samcday/mainlineNERD/actions/runs/37455170695/job/112240883529
+Specifications / Validate OpenSpec: success, seven seconds.
+The run API reports the same head SHA as the tested commit.
+
+CodeRabbit's status message reports a skipped review. It is not independent
+review approval. Delta /review remains pending. No product tests ran.
+
+Audit scope clarification: the Actions install step uses --no-audit because this
+job checks specification structure. The dependency audit was run separately and
+remains nonzero. The earlier note's suppression wording does not mean CI audits
+dependencies. No advisory was dismissed or accepted.
+
+The HTTPS OAuth credential could not push workflow files. Existing SSH access to
+the same repository successfully published the branch and evidence. No credentials,
+OAuth scopes, remote URLs, or repository protections were changed.
