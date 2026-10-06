@@ -34,6 +34,12 @@ request. Stop for genuine blockers or ambiguous scope.
 - Do not alter signing settings or bypass contribution requirements. There was
   no repository-specific signing, CLA, DCO, or submission-template requirement
   when this skill was created; newly introduced requirements still apply.
+- Read `AGENTS.md` and `docs/workflow.md`. For product changes, identify the
+  approved OpenSpec change, its scenario evidence, and its dependency PRs.
+  OpenSpec readiness, validation, checked tasks, or archive do not grant approval
+  to merge. Land an explicitly authorized stack in dependency order.
+- A merge is not a software release. Release publication needs Sam's separate,
+  explicit approval.
 
 Useful read-only commands:
 
@@ -72,8 +78,9 @@ gh api repos/samcday/mainlineNERD/rules/branches/main
 
 ## Verify the exact change
 
-The current baseline contains only `README.md` and `.gitignore`; neither defines
-a build or test command. For documentation, ignore rules, and skill-only changes:
+Run the repository's current checks, including `npm ci --ignore-scripts` and
+`npm run check:specs`. OpenSpec validation checks document structure, not product
+behavior. For documentation, ignore rules, and skill-only changes:
 
 - Run `git diff --check` for pending edits, `git diff --cached --check` for staged
   edits, and `git diff --check <source-remote>/main...HEAD` for the complete PR.
@@ -103,6 +110,10 @@ For the PR:
    findings within the approved scope; ask about disputed requirements or changes
    requiring a design decision. An acknowledgement or completed bot check is not
    an approval.
+   For an OpenSpec product change, require evidence for every acceptance scenario,
+   completed implementation tasks, and the main-spec/archive updates in the
+   reviewed diff. Missing or weakened scenarios are blockers. Preserve unrelated
+   pending proposals; do not require the entire backlog to be implemented.
 4. Verify **every required check and review has passed for that head**, including
    requirements imposed by repository policy or the user's instructions even
    when GitHub does not enforce them. Required checks that are pending, failing,

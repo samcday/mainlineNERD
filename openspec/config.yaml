@@ -1,0 +1,37 @@
+schema: spec-driven
+
+context: |
+  Read AGENTS.md and docs/workflow.md before work.
+  The first product work is a durable SQLite cache and synthetic local Synapse
+  tests. No real Matrix access is approved. Do not build a homeserver or crawler.
+  Preserve previously public cached history through outages and privacy changes.
+  Use maintained Matrix libraries. Aim for about 5,000 handwritten Rust lines,
+  including tests and xtask. Our code is GPL-3.0-or-later.
+  Sam must approve scope and acceptance behavior before implementation.
+  Artifact readiness is not approval. Delta /review and explicit /land remain
+  the review and merge gates. Each software release needs separate Sam approval.
+rules:
+  proposal:
+    - State the user outcome, non-goals, dependencies, and approval status/reference.
+    - Distinguish approval to investigate or plan from approval to implement.
+  specs:
+    - Give each scenario a stable ID and observable expected results.
+    - Use synthetic data and local services. Do not promise exhaustive Matrix history.
+    - State exact counts or bounds where they define acceptance, not invented production SLOs.
+  design:
+    - Compare meaningful alternatives and state the evidence and remaining unknowns.
+    - Define a small implementation boundary, failure behavior, and local test approach.
+  tasks:
+    - Every task must name its scenario IDs and the check that proves completion.
+    - Product changes must include executable tests and matching CI jobs.
+    - Keep tasks unchecked until their stated checks pass. Return changed acceptance to Sam.
+operations:
+  apply:
+    guidance:
+      - Confirm the proposal records Sam's approval before changing product code.
+      - Run each task's checks and record evidence before checking its box.
+      - Stop when blocked or no approved work remains. Do not create more scope.
+  archive:
+    guidance:
+      - Do not archive incomplete or unverified changes even if the CLI permits it.
+      - Include main-spec updates and the archived change in the PR before final Delta review.
