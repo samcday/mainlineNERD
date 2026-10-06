@@ -1,0 +1,50 @@
+OpenSpec setup verification, 2026-10-06
+Repository: samcday/mainlineNERD
+Tested commit: 2f4138b2c2426f4e7a9e00fa910ee05c97e4ffb2
+Base: 8e6e615eb92e666c16ae4995bba17a422d1c8b8f
+Environment: Node v22.23.1, npm 10.9.8, OpenSpec 1.14.1, Linux.
+
+Scope: workflow/tooling and two proposed cache-first changes. No Rust product code
+or Synapse fixture exists in this commit. No runtime product test is claimed.
+
+Checks rerun after committing:
+- npm ci --ignore-scripts: exit 0; 70 dependencies installed. Audit findings below.
+- npm run check:specs: exit 0; 2 changes passed strict validation, 0 failed.
+- openspec instructions apply --change <name> --json: both changes show 0 of 6
+  implementation tasks complete. Assertions confirmed approval context and apply
+  guidance are present. CLI artifact completeness is not implementation approval.
+- git diff --check origin/main...HEAD: exit 0; working tree clean.
+- Six shared skills compared byte-for-byte with output generated in a temporary
+  directory by the locked CLI using init --tools agents --profile core --no-animation.
+  All six match. No generated instruction was edited.
+- LICENSE compared byte-for-byte with the SPDX GPL-3.0-or-later text at
+  https://raw.githubusercontent.com/spdx/license-list-data/main/text/GPL-3.0-or-later.txt
+  Match confirmed. Project license grant is GPL-3.0-or-later; OpenSpec notices remain MIT.
+- Workflow YAML parsed with the installed yaml library. Assertions confirmed
+  read-only contents permission, standard ubuntu-24.04 runner, five-minute timeout,
+  pinned action commits, no pull_request_target, no persisted checkout credentials,
+  disabled package-manager caching, and cancellation of superseded runs.
+- Negative structural-validation test: copied openspec/ into a temporary directory,
+  replaced durable-cache's '#### Scenario:' headers with '### Scenario:', then ran
+  the same pinned CLI's validate --all --strict --json. It rejected the copy with
+  exit 1. The repository files were unchanged.
+- Scenario/task inspection: 7 CACHE scenarios and 11 MATRIX/FIXTURE scenarios have
+  unique IDs and task references. All 12 implementation tasks remain unchecked.
+
+Known unresolved dependency finding:
+- npm audit --json exits 1 with four high-severity package findings caused by the
+  single braces advisory GHSA-vfj7-8cjw-p6xm / CVE-2026-93687.
+- Chain: @fission-ai/openspec -> fast-glob -> micromatch -> braces 3.0.3.
+- Advisory: https://github.com/advisories/GHSA-vfj7-8cjw-p6xm
+- The advisory lists no patched braces version. Deeply nested brace patterns can
+  exhaust the Node process stack. This is development tooling, not a Matrix runtime
+  dependency. Reachability through this repository's default schema was not assessed.
+- npm suggests downgrading OpenSpec to 0.17.2. No force-fix, downgrade, override,
+  audit suppression, or risk acceptance was performed. Review before landing.
+
+Diff size: 1,354 generated skill lines, 1,076 dependency-lock lines, 232 standard
+license lines, and 928 other setup/planning additions. Handwritten Rust: 0 lines.
+
+No real Matrix APIs, accounts, rooms, media, transcripts, or credentials were used.
+No product change was archived. No merge, release, deployment, or protection change
+was performed. Independent Delta review and detailed story approval remain pending.
