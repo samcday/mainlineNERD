@@ -1,0 +1,15 @@
+{
+  "name": "mainlinenerd-development",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "openspec": "openspec",
+    "check:specs": "openspec validate --all --strict"
+  },
+  "devDependencies": {
+    "@fission-ai/openspec": "1.14.1"
+  }
+}
